@@ -184,6 +184,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.alphaValue = 0.01
         if args.contains("--tall") { panel.setContentSize(NSSize(width: 430, height: 1060)) }
         if args.contains("--demo") { store.loadDemo() }
+        if args.contains("--settings") { store.showingSettings = true }
+        if let i = args.firstIndex(of: "--delay"), let d = Double(args[i + 1]) { store.sendDelay = d }
         if args.contains("--oneway") { store.flows[0].loop = false }
         if args.contains("--half") { store.flows[0].b = nil }
         if args.contains("--peek"), let a = store.flows[0].a { store.peeking.insert(a) }

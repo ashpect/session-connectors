@@ -58,6 +58,8 @@ struct FlowHeader: View {
             Spacer()
             ModeToggle(loop: $flow.loop)
             Menu {
+                Button("Turn on without sending") { store.arm(flow.id) }
+                    .disabled(!flow.isComplete || (flow.enabled && flow.halted == nil))
                 Button("Swap top and bottom") { store.swap(flow.id) }.disabled(!flow.isComplete)
                 Divider()
                 Button("Delete flow", role: .destructive) { store.removeFlow(flow.id) }
@@ -621,6 +623,27 @@ struct FlowStatus: View {
     let b: Session
 
     var body: some View {
+        if let until = flow.pendingUntil, let to = store.session(flow.pendingTo), store.running, flow.halted == nil {
+            // Waiting out the send delay from Settings.
+            TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                HStack(spacing: 5) {
+                    Image(systemName: "timer")
+                    Text("Sending to \(to.kind.label) in \(max(0, Int(until.timeIntervalSince(ctx.date).rounded(.up))))s")
+                        .monospacedDigit()
+                        .lineLimit(1)
+                    Button("Send now") { store.sendNow(flow.id) }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(to.kind.tint)
+                }
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(Theme.text2)
+            }
+        } else {
+            status
+        }
+    }
+
+    @ViewBuilder private var status: some View {
         let busy = store.session(flow.busy)
         let (icon, text, color): (String, String, Color) =
             if !store.running { ("pause.circle.fill", "Relay is paused", Theme.paused) }

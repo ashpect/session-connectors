@@ -135,6 +135,8 @@ struct Flow: Identifiable, Equatable, Codable {
     var backSends = 0
     var halted: String?
     var busy: String?         // the session currently answering something this flow sent it
+    var pendingUntil: Date?   // an answer is waiting out the send delay until then…
+    var pendingTo: String?    // …on its way to this session
     var forwardPulse = 0
     var backPulse = 0
 
@@ -186,6 +188,8 @@ final class RelayStore {
     var flashID: String?
     var peeking: Set<String> = []
     var inFlight = 0
+    var showingSettings = false
+    var sendDelay = 0.0       // seconds to wait after an answer before pasting it into the next session
 
     var simulating: Bool { inFlight > 0 }
 
@@ -200,6 +204,8 @@ final class RelayStore {
     @ObservationIgnored private var outbox: [String: [String]] = [:]       // waiting for a busy pane
     @ObservationIgnored private var lastStop: [String: String] = [:]
     @ObservationIgnored private var lastSaved = Data()
+    @ObservationIgnored private var pendingWork: [UUID: () -> Void] = [:]
+    @ObservationIgnored private var persists = false   // only the real app (not --snapshot renders) writes state
 
     func session(_ id: String?) -> Session? { id.flatMap { id in sessions.first { $0.id == id } } }
 
@@ -315,6 +321,9 @@ final class RelayStore {
         flows[i].backSends = 0
         flows[i].halted = nil
         flows[i].busy = nil
+        flows[i].pendingUntil = nil
+        flows[i].pendingTo = nil
+        pendingWork[flows[i].id] = nil
     }
 
     /// Turns the flow on. If A has an answer already (and isn't mid-turn), it goes down right away;
@@ -339,12 +348,25 @@ final class RelayStore {
         }
     }
 
+    /// Turns the flow on without sending anything now; the first session's next answer starts it.
+    func arm(_ flowID: UUID) {
+        guard let i = index(of: flowID), let src = session(flows[i].a), let dst = session(flows[i].b) else { return }
+        withAnimation(.snappy) {
+            resetRun(i)
+            flows[i].enabled = true
+        }
+        note(.info, from: src.kind, to: dst.kind, "On · \(src.kind.label)'s next answer goes to \(dst.kind.label)")
+    }
+
     func stop(_ flowID: UUID) {
         guard let i = index(of: flowID) else { return }
         withAnimation(.snappy) {
             flows[i].enabled = false
             flows[i].busy = nil
+            flows[i].pendingUntil = nil
+            flows[i].pendingTo = nil
         }
+        pendingWork[flowID] = nil
         note(.info, "Stopped a flow")
     }
 
@@ -386,6 +408,39 @@ final class RelayStore {
             return
         }
 
+        let message = Flow.compose(forward ? f.forward : f.back, answer: answer)
+        let flowID = f.id
+        let work = { [weak self] in
+            guard let self, let j = index(of: flowID), flows[j].enabled, flows[j].halted == nil, running else { return }
+            pendingWork[flowID] = nil
+            withAnimation(.snappy) {
+                self.flows[j].pendingUntil = nil
+                self.flows[j].pendingTo = nil
+            }
+            commit(j, from: src, to: dst, forward: forward, answer: answer, message: message)
+        }
+        guard sendDelay > 0 else { return work() }
+
+        // Wait out the delay first. A newer answer replaces the waiting one; Stop cancels it.
+        let fire = Date().addingTimeInterval(sendDelay)
+        pendingWork[flowID] = work
+        withAnimation(.snappy) {
+            flows[i].pendingUntil = fire
+            flows[i].pendingTo = to
+        }
+        note(.info, from: src.kind, to: dst.kind, "Sending to \(dst.kind.label) in \(Int(sendDelay))s")
+        DispatchQueue.main.asyncAfter(deadline: .now() + sendDelay) { [weak self] in
+            guard let self, let j = index(of: flowID), flows[j].pendingUntil == fire else { return }
+            pendingWork[flowID]?()
+        }
+    }
+
+    /// Skip the rest of the send delay.
+    func sendNow(_ flowID: UUID) {
+        pendingWork[flowID]?()
+    }
+
+    private func commit(_ i: Int, from src: Session, to dst: Session, forward: Bool, answer: String, message: String) {
         if forward {
             flows[i].rounds += 1
             flows[i].forwardPulse += 1
@@ -393,14 +448,13 @@ final class RelayStore {
             flows[i].backSends += 1
             flows[i].backPulse += 1
         }
-        let message = Flow.compose(forward ? f.forward : f.back, answer: answer)
         note(.send, from: src.kind, to: dst.kind, "\(Demo.gist(answer)) · \(message.count.formatted()) chars")
-        withAnimation(.snappy) { flows[i].busy = to }
-        flash(to)
+        withAnimation(.snappy) { flows[i].busy = dst.id }
+        flash(dst.id)
         if dst.isDemo {
-            simulateReply(from: to, flowID: f.id)
+            simulateReply(from: dst.id, flowID: flows[i].id)
         } else {
-            send(message, to: to)
+            send(message, to: dst.id)
         }
     }
 
@@ -481,23 +535,31 @@ final class RelayStore {
     }
 
     /// Which docked pane an event belongs to. Claude's hooks run inside the pane, so they carry its
-    /// id. Codex runs turns in a background daemon, so for Codex we match the thread to a pane once
-    /// (by what we pasted, the folder, or text on screen) and remember it.
+    /// id. Codex usually runs turns in a background daemon, so a Codex thread is matched to its pane
+    /// (by the text we pasted, the folder, or what's on screen) and the match is remembered.
     private func resolvePane(_ e: HookEvent, completion: @escaping (String?) -> Void) {
-        if !e.pane.isEmpty { return completion(e.pane) }
-        if let p = threadPanes[e.session] { return completion(p) }
+        if e.agent != "codex", !e.pane.isEmpty { return completion(e.pane) }
         func remember(_ pane: String?) {
             if let pane, !e.session.isEmpty { threadPanes[e.session] = pane }
             completion(pane)
         }
-        if !e.tty.isEmpty, let s = sessions.first(where: { $0.tty == e.tty }) { return remember(s.id) }
+        // We typed this exact prompt into a pane a moment ago: strongest evidence there is.
         if e.event == "UserPromptSubmit", !e.prompt.isEmpty {
-            let key = Self.normalize(e.prompt)
-            if let hit = awaiting.first(where: { Self.normalize($0.value.text) == key }) { return remember(hit.key) }
+            let key = String(Self.normalize(e.prompt).prefix(160))
+            if let hit = awaiting.first(where: { String(Self.normalize($0.value.text).prefix(160)) == key }) {
+                return remember(hit.key)
+            }
         }
+        if let p = threadPanes[e.session] { return completion(p) }
+        if !e.pane.isEmpty, session(e.pane)?.kind == .codex { return remember(e.pane) }
+        if !e.tty.isEmpty, let s = sessions.first(where: { $0.tty == e.tty }) { return remember(s.id) }
 
         // Look across every iTerm pane (docked or not) running this agent in this folder.
-        let snippet = String(Self.normalize(e.event == "Stop" ? e.answer : e.prompt).prefix(40))
+        // A finished answer's end is what's visible on screen; a fresh prompt's start is.
+        let lastLine = e.answer.split(whereSeparator: \.isNewline).last { !Self.normalize(String($0)).isEmpty }.map(String.init) ?? ""
+        let snippet = e.event == "Stop"
+            ? String(Self.normalize(lastLine).suffix(40))
+            : String(Self.normalize(e.prompt).prefix(40))
         let kind = AgentKind(rawValue: e.agent) ?? .shell
         ITerm.allSessions { [weak self] result in
             guard let self, case .success(let all) = result else { return completion(nil) }
@@ -520,7 +582,7 @@ final class RelayStore {
 
     private static func normalize(_ s: String) -> String {
         s.lowercased()
-            .replacingOccurrences(of: #"[*_`#>•›⏺]"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"[*_`#>•›⏺│|\-]"#, with: "", options: .regularExpression)
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
     }
@@ -626,6 +688,9 @@ final class RelayStore {
         var sessions: [Session]
         var flows: [Flow]
         var threadPanes: [String: String]
+        var sendDelay: Double?
+        var fadeWhenIdle: Bool?
+        var opacity: Double?
     }
 
     func load() {
@@ -634,30 +699,39 @@ final class RelayStore {
         sessions = saved.sessions
         flows = saved.flows.isEmpty ? [Flow()] : saved.flows
         threadPanes = saved.threadPanes
+        sendDelay = saved.sendDelay ?? 0
+        fadeWhenIdle = saved.fadeWhenIdle ?? true
+        opacity = saved.opacity ?? 1
         lastSaved = data
     }
 
     func startSaving() {
+        persists = true
         saveTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.save() }
     }
 
     func save() {
+        guard persists else { return }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(Saved(sessions: sessions, flows: flows, threadPanes: threadPanes)),
+        let saved = Saved(sessions: sessions, flows: flows, threadPanes: threadPanes,
+                          sendDelay: sendDelay, fadeWhenIdle: fadeWhenIdle, opacity: opacity)
+        guard let data = try? encoder.encode(saved),
               data != lastSaved else { return }
         try? FileManager.default.createDirectory(atPath: RelayPaths.dir, withIntermediateDirectories: true)
         if FileManager.default.createFile(atPath: RelayPaths.state, contents: data) { lastSaved = data }
     }
 
+    static func hookInstalled(_ agent: AgentKind) -> Bool {
+        let path = NSHomeDirectory() + (agent == .claude ? "/.claude/settings.json" : "/.codex/hooks.json")
+        return (try? String(contentsOfFile: path, encoding: .utf8))?.contains(RelayPaths.hook) ?? false
+    }
+
     /// Relay only hears about turns through hooks in Claude Code and Codex; say so if they're missing.
     func checkHooks() {
-        func has(_ path: String) -> Bool {
-            (try? String(contentsOfFile: path, encoding: .utf8))?.contains(RelayPaths.hook) ?? false
-        }
         var missing: [String] = []
-        if !has(NSHomeDirectory() + "/.claude/settings.json") { missing.append("Claude Code") }
-        if !has(NSHomeDirectory() + "/.codex/hooks.json") { missing.append("Codex") }
+        if !Self.hookInstalled(.claude) { missing.append("Claude Code") }
+        if !Self.hookInstalled(.codex) { missing.append("Codex") }
         if !missing.isEmpty {
             notice = "Relay's hooks aren't installed in \(missing.joined(separator: " or ")), so it can't hear when their turns end."
         }

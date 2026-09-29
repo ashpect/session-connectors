@@ -68,7 +68,7 @@ Open Relay from the menu bar icon (two dots joined by a thread), or press **⌃�
 2. **Write the prompts.** Click the prompt on a connection to edit it. The answer goes where `{answer}` is. If you leave `{answer}` out, the answer is added at the end, and an empty prompt sends the answer as-is.
 3. **Turn on Loop** if the reply should come back up to the first session.
 4. **Set the stop rule:** stop when *either / Claude / Codex* says a phrase, with a maximum number of rounds as a backstop. It helps to ask for the phrase in your prompt, for example "Say LGTM if nothing is blocking."
-5. **Press Start.** Relay sends the first session's latest answer right away. If that session hasn't answered since Relay started, its next answer goes first. **Stop** ends a flow, and **Live / Paused** in the header pauses every flow.
+5. **Press Start.** Relay sends the first session's latest answer right away. If that session hasn't answered since Relay started, its next answer goes first. To switch a flow on *without* sending the latest answer (say, you've already dealt with it), use the flow's **⋯ → Turn on without sending**. **Stop** ends a flow, and **Live / Paused** in the header pauses every flow.
 
 Want to look around before connecting real sessions? Choose **⋯ → Load demo flow**.
 
@@ -81,6 +81,14 @@ Want to look around before connecting real sessions? Choose **⋯ → Load demo 
 | Stop | when **Codex** says `LGTM`, at most 10 rounds |
 
 Ask Claude for the plan as you normally would. Once it answers, Relay takes it from there.
+
+### Settings
+
+Open **⋯ → Settings…** to find:
+
+- **Wait before sending.** After a session answers, Relay can wait a few seconds (anything from 0 to 600) before pasting the answer into the next session. While it waits, the flow counts down ("Sending to Codex in 8s") with a **Send now** button, and **Stop** cancels the send. The default is off.
+- **Window options:** fade when the cursor isn't over Relay, and opacity.
+- **Hook status** for Claude Code and Codex, plus the list of shortcuts.
 
 ### Shortcuts
 
@@ -147,12 +155,12 @@ This removes Relay's hook entries (and nothing else) from your Claude Code and C
 | `Sources/Relay/Views.swift`, `FlowViews.swift` | The SwiftUI interface |
 | `scripts/hooks.py` | Adds and removes Relay's hook entries in the agents' settings |
 
-Both agents report the answer in their `Stop` hook as `last_assistant_message`. The hook runs inside the pane's process tree, so `$ITERM_SESSION_ID` identifies the pane. For Codex setups where that variable isn't available, Relay falls back to matching the thread to a pane by folder and by the text on screen.
+Both agents report the answer in their `Stop` hook as `last_assistant_message`. For Claude Code, the hook runs inside the pane's process tree, so `$ITERM_SESSION_ID` identifies the pane. Codex usually runs turns in a shared background daemon (`codex app-server`). Its environment belongs to whichever pane happened to start the daemon, so `relay-hook` ignores the pane ID there. Relay instead matches the Codex thread to its pane by the exact prompt it pasted (Codex's `UserPromptSubmit` carries it), falling back to the folder and the text on screen, and it remembers the match.
 
 To render the interface to an image without a screen, which is handy for checking layout changes:
 
 ```sh
-build/Relay.app/Contents/MacOS/Relay --snapshot out.png --demo [--sim --at 3] [--oneway] [--peek]
+build/Relay.app/Contents/MacOS/Relay --snapshot out.png --demo [--sim --at 3] [--oneway] [--peek] [--settings] [--delay 10]
 ```
 
 ## Limitations
