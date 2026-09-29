@@ -41,6 +41,12 @@ struct SettingsView: View {
             }
             .onChange(of: store.sendDelay) { store.sendDelay = min(600, max(0, store.sendDelay.rounded())) }
 
+            SettingsGroup(title: "Presets") {
+                ForEach(Preset.builtIns) { PresetRow(preset: $0) }
+                ForEach(store.presets) { PresetRow(preset: $0) }
+                Hint("Apply one from the book menu on any flow. To save your own, set a flow up, then pick Save as preset… from that menu. Saved presets live in ~/.relay/presets.json, so you can share the file.")
+            }
+
             SettingsGroup(title: "Window") {
                 Toggle(isOn: $store.fadeWhenIdle) { Text("Fade when the cursor isn't over Relay").font(.system(size: 12.5)) }
                     .toggleStyle(.switch)
@@ -135,6 +141,54 @@ struct ShortcutRow: View {
                 .foregroundStyle(Theme.text2)
                 .padding(.horizontal, 7).padding(.vertical, 2)
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.25)))
+        }
+    }
+}
+
+struct PresetRow: View {
+    @Environment(RelayStore.self) private var store
+    let preset: Preset
+    @State private var name = ""
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: preset.loop ? "arrow.triangle.2.circlepath" : "arrow.down")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(Theme.text3)
+                .frame(width: 14)
+                .help(preset.loop ? "Loop" : "One-way")
+            if preset.builtIn {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(preset.name).font(.system(size: 12.5))
+                    if !preset.note.isEmpty { Text(preset.note).font(.system(size: 10.5)).foregroundStyle(Theme.text3) }
+                }
+            } else {
+                TextField("Name", text: $name)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12.5))
+                    .onSubmit { store.renamePreset(preset.id, to: name) }
+                    .onAppear { name = preset.name }
+                    .help("Rename, then press Return")
+            }
+            Spacer(minLength: 4)
+            if !preset.stopPhrase.isEmpty {
+                Text(preset.stopPhrase)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Theme.text2)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.black.opacity(0.25)))
+                    .help("Stops when it sees this")
+            }
+            if preset.builtIn {
+                Text("Built in").font(.system(size: 10)).foregroundStyle(Theme.text3)
+            } else {
+                Button { store.deletePreset(preset.id) } label: {
+                    Image(systemName: "trash").font(.system(size: 10.5))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.text3)
+                .help("Delete this preset")
+            }
         }
     }
 }

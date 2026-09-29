@@ -7,14 +7,24 @@ struct FlowCard: View {
     @Environment(RelayStore.self) private var store
     let flowID: UUID
     let number: Int
+    @State private var savingPreset = false
 
     var body: some View {
         let flow = store.binding(flowID)
         let f = flow.wrappedValue
         let a = store.session(f.a), b = store.session(f.b)
         VStack(alignment: .leading, spacing: 0) {
-            FlowHeader(flow: flow, number: number, a: a, b: b)
+            FlowHeader(flow: flow, number: number, a: a, b: b, savingPreset: $savingPreset)
                 .padding(.bottom, 10)
+            if savingPreset {
+                SavePresetRow(flowID: flowID, saving: $savingPreset)
+                    .padding(.bottom, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            } else if let applied = store.undoApply[flowID] {
+                AppliedPresetRow(name: applied.name) { store.undoPreset(flowID) }
+                    .padding(.bottom, 10)
+                    .transition(.opacity)
+            }
             SlotView(flow: flow, slot: .a)
             if let a, let b {
                 Lanes(flow: flow, a: a, b: b)
@@ -42,21 +52,16 @@ struct FlowHeader: View {
     let number: Int
     let a: Session?
     let b: Session?
+    @Binding var savingPreset: Bool
 
     var body: some View {
         HStack(spacing: 8) {
             SectionLabel("Flow \(number)")
-            if let a, let b {
-                HStack(spacing: 3) {
-                    AgentGlyph(kind: a.kind, size: 13)
-                    Image(systemName: flow.loop ? "arrow.left.arrow.right" : "arrow.right")
-                        .font(.system(size: 7.5, weight: .heavy))
-                        .foregroundStyle(Theme.text3)
-                    AgentGlyph(kind: b.kind, size: 13)
-                }
-            }
-            Spacer()
+            PresetMenu(flow: $flow, saving: $savingPreset)
+            Spacer(minLength: 4)
             ModeToggle(loop: $flow.loop)
+                .fixedSize()
+                .layoutPriority(1)
             Menu {
                 Button("Turn on without sending") { store.arm(flow.id) }
                     .disabled(!flow.isComplete || (flow.enabled && flow.halted == nil))
@@ -714,5 +719,110 @@ struct NewFlowButton: View {
             .buttonStyle(.plain)
             .foregroundStyle(Theme.text2)
         }
+    }
+}
+
+// MARK: - Presets
+
+/// The book menu on each flow: fill it from a preset, or save its setup as one.
+struct PresetMenu: View {
+    @Environment(RelayStore.self) private var store
+    @Binding var flow: Flow
+    @Binding var saving: Bool
+
+    var body: some View {
+        let current = store.preset(flow.presetID)
+        let edited = current.map { !$0.matches(flow) } ?? false
+        Menu {
+            Section("Built in") {
+                ForEach(Preset.builtIns) { p in
+                    Button(p.name) { store.apply(p, to: flow.id) }
+                }
+            }
+            if !store.presets.isEmpty {
+                Section("Saved") {
+                    ForEach(store.presets) { p in
+                        Button(p.name) { store.apply(p, to: flow.id) }
+                    }
+                }
+            }
+            Divider()
+            if let current, !current.builtIn, edited {
+                Button("Update \u{201C}\(current.name)\u{201D} with this setup") { store.updatePreset(current.id, from: flow.id) }
+            }
+            Button("Save as preset…") { withAnimation(.snappy) { saving = true } }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "text.book.closed").font(.system(size: 9.5, weight: .semibold))
+                Text(current.map { Self.short($0.name) + (edited ? " •" : "") } ?? "Presets")
+                    .lineLimit(1)
+            }
+            .font(.system(size: 10.5, weight: .semibold))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.visible)
+        .fixedSize()
+        .foregroundStyle(current == nil ? Theme.text2 : Theme.text1)
+        .help(current.map { edited ? "\($0.name), edited since you applied it" : ($0.note.isEmpty ? $0.name : $0.note) }
+              ?? "Fill this flow from a preset, or save its setup as one")
+    }
+
+    private static func short(_ name: String) -> String {
+        name.count > 15 ? String(name.prefix(14)) + "…" : name
+    }
+}
+
+struct SavePresetRow: View {
+    @Environment(RelayStore.self) private var store
+    let flowID: UUID
+    @Binding var saving: Bool
+    @State private var name = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "text.book.closed").font(.system(size: 11)).foregroundStyle(Theme.live)
+            TextField("Name this preset", text: $name)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .focused($focused)
+                .onSubmit(save)
+                .onExitCommand { saving = false }
+            Button("Save", action: save)
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.live)
+            Button("Cancel") { withAnimation(.snappy) { saving = false } }
+                .buttonStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.text3)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.black.opacity(0.25)))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Theme.live.opacity(0.4)))
+        .onAppear { DispatchQueue.main.async { focused = true } }
+    }
+
+    private func save() {
+        store.savePreset(from: flowID, name: name)
+        withAnimation(.snappy) { saving = false }
+    }
+}
+
+struct AppliedPresetRow: View {
+    let name: String
+    let undo: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.live)
+            Text("Applied \u{201C}\(name)\u{201D}").lineLimit(1)
+            Spacer()
+            Button("Undo", action: undo).buttonStyle(.plain).foregroundStyle(Theme.text1).fontWeight(.semibold)
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(Theme.text2)
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Theme.live.opacity(0.1)))
     }
 }

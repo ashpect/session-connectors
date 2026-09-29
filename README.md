@@ -72,15 +72,25 @@ Open Relay from the menu bar icon (two dots joined by a thread), or press **⌃�
 
 Want to look around before connecting real sessions? Choose **⋯ → Load demo flow**.
 
-### Example: a plan-review loop
+### Presets
 
-| Direction | Prompt |
-|---|---|
-| Claude → Codex | `Review the updated plan. List blocking issues first, then nits. Say LGTM if nothing is blocking.` |
-| Codex → Claude | `Codex reviewed your plan:` `{answer}` `Fix the blocking issues and update PLAN.md.` |
-| Stop | when **Codex** says `LGTM`, at most 10 rounds |
+A preset is a saved flow setup: one-way or loop, both prompts, and the stop rule. It doesn't include the sessions, so the same preset works for any pair of panes. Open the book menu at the top of a flow to use one:
 
-Ask Claude for the plan as you normally would. Once it answers, Relay takes it from there.
+- **Apply a preset.** The flow fills in right away, and an **Undo** bar appears for a few seconds in case you picked the wrong one.
+- **Save as preset…** Name the flow's current setup and reuse it on other flows.
+- **Update "…" with this setup** appears after you've edited a flow that came from one of your saved presets. It updates the preset to match. A dot after the preset's name (`My review loop •`) means the flow has changed since you applied it.
+
+Relay ships with three presets:
+
+| Preset | Mode | What it does | Stops when |
+|---|---|---|---|
+| **Plan review** | Loop | One session writes the plan and the other reviews it; the review goes back for fixes | the reviewer says `LGTM` (max 6 rounds) |
+| **Plan discussion** | Loop | Two peers talk the plan through, accepting points and pushing back | either says `AGREED` (max 6 rounds) |
+| **Second opinion** | One-way | Sends an answer off for a quick check | — |
+
+You can see and rename your saved presets, or delete them, in **⋯ → Settings… → Presets**. They're stored in `~/.relay/presets.json`, so you can copy that file to share them.
+
+For example, to review a plan with Claude and Codex: put Claude (writing the plan) in the top slot and Codex in the bottom, apply **Plan review**, and press **Start**. Or ask Claude for the plan first; once it answers, Relay takes it from there.
 
 ### Settings
 
@@ -160,7 +170,7 @@ Both agents report the answer in their `Stop` hook as `last_assistant_message`. 
 To render the interface to an image without a screen, which is handy for checking layout changes:
 
 ```sh
-build/Relay.app/Contents/MacOS/Relay --snapshot out.png --demo [--sim --at 3] [--oneway] [--peek] [--settings] [--delay 10]
+build/Relay.app/Contents/MacOS/Relay --snapshot out.png --demo [--sim --at 3] [--oneway] [--peek] [--settings] [--delay 10] [--preset plan-review]
 ```
 
 ## Limitations

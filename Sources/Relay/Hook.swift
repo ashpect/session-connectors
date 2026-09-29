@@ -5,6 +5,7 @@ enum RelayPaths {
     static let dir = NSHomeDirectory() + "/.relay"
     static let socket = dir + "/relay.sock"
     static let state = dir + "/state.json"
+    static let presets = dir + "/presets.json"
     static let hook = dir + "/relay-hook"
     static let hookLog = dir + "/hook.log"
 }

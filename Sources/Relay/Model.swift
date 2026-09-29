@@ -130,6 +130,7 @@ struct Flow: Identifiable, Equatable, Codable {
     var stopWatch = Watch.either
     var maxRounds = 10
     var enabled = false       // on after Start; answers only move while a flow is on
+    var presetID: String?     // the preset this flow was set up from, if any
 
     var rounds = 0            // A → B sends in this run
     var backSends = 0
@@ -141,7 +142,7 @@ struct Flow: Identifiable, Equatable, Codable {
     var backPulse = 0
 
     private enum CodingKeys: String, CodingKey {
-        case id, a, b, forward, back, loop, stopPhrase, stopWatch, maxRounds
+        case id, a, b, forward, back, loop, stopPhrase, stopWatch, maxRounds, presetID
     }
 
     var isComplete: Bool { a != nil && b != nil }
@@ -189,6 +190,8 @@ final class RelayStore {
     var peeking: Set<String> = []
     var inFlight = 0
     var showingSettings = false
+    var presets: [Preset] = []                  // the ones you saved; built-ins live in Preset.builtIns
+    var undoApply: [UUID: AppliedPreset] = [:]  // lets you take back applying a preset for a few seconds
     var sendDelay = 0.0       // seconds to wait after an answer before pasting it into the next session
 
     var simulating: Bool { inFlight > 0 }
@@ -368,6 +371,99 @@ final class RelayStore {
         }
         pendingWork[flowID] = nil
         note(.info, "Stopped a flow")
+    }
+
+    // MARK: Presets
+
+    struct AppliedPreset: Equatable {
+        let before: Flow
+        let name: String
+    }
+
+    var allPresets: [Preset] { Preset.builtIns + presets }
+
+    func preset(_ id: String?) -> Preset? { id.flatMap { id in allPresets.first { $0.id == id } } }
+
+    /// Fills the flow with a preset's mode, prompts, and stop rule. Sessions stay as they are.
+    func apply(_ p: Preset, to flowID: UUID) {
+        guard let i = index(of: flowID) else { return }
+        let before = flows[i]
+        withAnimation(.snappy) {
+            flows[i].loop = p.loop
+            flows[i].forward = p.forward
+            flows[i].back = p.back
+            flows[i].stopPhrase = p.stopPhrase
+            flows[i].stopWatch = p.stopWatch
+            flows[i].maxRounds = p.maxRounds
+            flows[i].presetID = p.id
+            undoApply[flowID] = AppliedPreset(before: before, name: p.name)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, undoApply[flowID]?.before == before else { return }
+            withAnimation(.snappy) { self.undoApply[flowID] = nil }
+        }
+    }
+
+    func undoPreset(_ flowID: UUID) {
+        guard let i = index(of: flowID), let u = undoApply[flowID] else { return }
+        withAnimation(.snappy) {
+            flows[i].loop = u.before.loop
+            flows[i].forward = u.before.forward
+            flows[i].back = u.before.back
+            flows[i].stopPhrase = u.before.stopPhrase
+            flows[i].stopWatch = u.before.stopWatch
+            flows[i].maxRounds = u.before.maxRounds
+            flows[i].presetID = u.before.presetID
+            undoApply[flowID] = nil
+        }
+    }
+
+    func savePreset(from flowID: UUID, name: String) {
+        guard let i = index(of: flowID) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let p = Preset(from: flows[i], name: trimmed.isEmpty ? "My preset" : trimmed)
+        withAnimation(.snappy) {
+            presets.append(p)
+            flows[i].presetID = p.id
+        }
+        savePresets()
+        note(.info, "Saved preset \u{201C}\(p.name)\u{201D}")
+    }
+
+    /// Overwrites a saved preset with the flow's current settings.
+    func updatePreset(_ id: String, from flowID: UUID) {
+        guard let i = index(of: flowID), let j = presets.firstIndex(where: { $0.id == id }) else { return }
+        var p = Preset(from: flows[i], name: presets[j].name)
+        p.id = id
+        p.note = presets[j].note
+        presets[j] = p
+        savePresets()
+    }
+
+    func renamePreset(_ id: String, to name: String) {
+        guard let j = presets.firstIndex(where: { $0.id == id }) else { return }
+        presets[j].name = name
+        savePresets()
+    }
+
+    func deletePreset(_ id: String) {
+        withAnimation(.snappy) { presets.removeAll { $0.id == id } }
+        savePresets()
+    }
+
+    func loadPresets() {
+        guard let data = FileManager.default.contents(atPath: RelayPaths.presets),
+              let saved = try? JSONDecoder().decode([Preset].self, from: data) else { return }
+        presets = saved.filter { !$0.builtIn }
+    }
+
+    private func savePresets() {
+        guard persists else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(presets) else { return }
+        try? FileManager.default.createDirectory(atPath: RelayPaths.dir, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: RelayPaths.presets, contents: data)
     }
 
     // MARK: Engine
@@ -694,6 +790,7 @@ final class RelayStore {
     }
 
     func load() {
+        loadPresets()
         guard let data = FileManager.default.contents(atPath: RelayPaths.state),
               let saved = try? JSONDecoder().decode(Saved.self, from: data) else { return }
         sessions = saved.sessions

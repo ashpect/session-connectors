@@ -186,6 +186,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if args.contains("--demo") { store.loadDemo() }
         if args.contains("--settings") { store.showingSettings = true }
         if let i = args.firstIndex(of: "--delay"), let d = Double(args[i + 1]) { store.sendDelay = d }
+        if let i = args.firstIndex(of: "--preset"), let p = store.allPresets.first(where: { $0.id == "builtin." + args[i + 1] }) {
+            store.apply(p, to: store.flows[0].id)
+        }
+        if args.contains("--saved-preset") {
+            store.presets = [Preset(from: store.flows[0], name: "My review loop")]
+            store.flows[0].presetID = store.presets[0].id
+            store.flows[0].stopPhrase = "SHIP IT"
+        }
         if args.contains("--oneway") { store.flows[0].loop = false }
         if args.contains("--half") { store.flows[0].b = nil }
         if args.contains("--peek"), let a = store.flows[0].a { store.peeking.insert(a) }
