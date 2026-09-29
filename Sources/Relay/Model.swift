@@ -366,6 +366,19 @@ final class RelayStore {
         }
     }
 
+    /// Picks a flow up where it left off: turns it on and sends that session's latest answer across.
+    func sendLatest(_ flowID: UUID, from slot: Flow.Slot) {
+        guard let i = index(of: flowID), let id = flows[i][slot], let src = session(id), !src.lastAnswer.isEmpty else { return }
+        guard running else { notice = "Relay is paused. Press Paused to go live."; return }
+        withAnimation(.snappy) {
+            flows[i].halted = nil
+            flows[i].enabled = true
+            if flows[i].rounds >= flows[i].maxRounds { flows[i].rounds = 0 }
+        }
+        note(.info, from: src.kind, "Resumed · sending \(src.kind.label)'s latest answer")
+        sessionFinished(id, answer: src.lastAnswer, only: flowID)
+    }
+
     /// Turns the flow on without sending anything now; the first session's next answer starts it.
     func arm(_ flowID: UUID) {
         guard let i = index(of: flowID), let src = session(flows[i].a), let dst = session(flows[i].b) else { return }

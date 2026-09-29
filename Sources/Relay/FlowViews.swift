@@ -65,6 +65,15 @@ struct FlowHeader: View {
             Menu {
                 Button("Turn on without sending") { store.arm(flow.id) }
                     .disabled(!flow.isComplete || (flow.enabled && flow.halted == nil))
+                if let a, let b {
+                    Button("Send \(a.kind.label)'s latest answer to \(b.kind.label)") { store.sendLatest(flow.id, from: .a) }
+                        .disabled(a.lastAnswer.isEmpty || flow.busy != nil)
+                    if flow.loop {
+                        Button("Send \(b.kind.label)'s latest answer to \(a.kind.label)") { store.sendLatest(flow.id, from: .b) }
+                            .disabled(b.lastAnswer.isEmpty || flow.busy != nil)
+                    }
+                }
+                Divider()
                 Button("Swap top and bottom") { store.swap(flow.id) }.disabled(!flow.isComplete)
                 Divider()
                 Button("Delete flow", role: .destructive) { store.removeFlow(flow.id) }
