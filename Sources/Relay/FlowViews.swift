@@ -573,9 +573,9 @@ struct FlowFooter: View {
                 FieldLabel(text: "Stop when")
                 if flow.loop {
                     Menu {
-                        Button("either says") { flow.stopWatch = .either }
-                        Button("\(a.kind.label) says") { flow.stopWatch = .a }
-                        Button("\(b.kind.label) says") { flow.stopWatch = .b }
+                        Button("either") { flow.stopWatch = .either }
+                        Button(a.kind.label) { flow.stopWatch = .a }
+                        Button(b.kind.label) { flow.stopWatch = .b }
                     } label: {
                         Text(watchLabel).font(.system(size: 11, weight: .semibold))
                     }
@@ -584,7 +584,8 @@ struct FlowFooter: View {
                 } else {
                     Text(a.kind.label).font(.system(size: 11, weight: .semibold))
                 }
-                FieldLabel(text: "says")
+                FieldLabel(text: "ends with")
+                    .help("Only a last line that's just this phrase counts, so \u{201C}Not \(flow.stopPhrase.isEmpty ? "LGTM" : flow.stopPhrase)\u{201D} won't stop the flow. Ask for it that way in your prompt.")
                 TextField("LGTM", text: $flow.stopPhrase)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11.5, design: .monospaced))

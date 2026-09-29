@@ -17,7 +17,7 @@ If you use two agents on the same plan, you end up copying Claude's plan into Co
 1. **Pick your sessions.** Click an empty slot in Relay, then click an iTerm pane. A thread follows your cursor out of Relay, latches onto the pane you click, and pulls that session into the slot.
 2. **Write what gets sent.** Each connection between the two sessions carries a prompt of your own. The answer is inserted wherever you put `{answer}`.
 3. **Pick one-way or loop.** One-way sends the first session's answers to the second. Loop also sends the second session's replies back, with a prompt of their own.
-4. **Set when to stop.** Stop when either session (or a particular one) says a phrase, or after a set number of rounds.
+4. **Set when to stop.** Stop when either session (or a particular one) ends its reply with a phrase such as `AGREED`, or after a set number of rounds.
 5. **Press Start.**
 
 Under the hood, Relay installs a small hook in Claude Code and in Codex. Whenever a turn ends, the hook passes the answer to Relay over a local socket. Relay wraps the answer in your prompt and pastes it into the other pane, just as if you'd pasted it yourself and pressed Return:
@@ -67,7 +67,7 @@ Open Relay from the menu bar icon (two dots joined by a thread), or press **⌃�
 1. **Fill a flow.** Click the top slot, then click the pane whose answers should go first, for example the Claude session writing your plan. Click the bottom slot, then click the pane that should receive them, for example Codex reviewing it. You can also press **Pick** twice (it fills the top slot, then the bottom), drag a session chip onto a slot, or use **Choose**.
 2. **Write the prompts.** Click the prompt on a connection to edit it. The answer goes where `{answer}` is. If you leave `{answer}` out, the answer is added at the end, and an empty prompt sends the answer as-is.
 3. **Turn on Loop** if the reply should come back up to the first session.
-4. **Set the stop rule:** stop when *either / Claude / Codex* says a phrase, with a maximum number of rounds as a backstop. It helps to ask for the phrase in your prompt, for example "Say LGTM if nothing is blocking."
+4. **Set the stop rule:** stop when *either / Claude / Codex* ends its reply with a phrase, with a maximum number of rounds as a backstop. Only a **last line that's just the phrase** counts (`AGREED`, `**AGREED**` and `AGREED.` all do). A reply that merely mentions it, like "Not AGREED, because…", keeps the loop going. Ask for it that way in your prompt: *"If you have concerns, don't use the word AGREED. Only when you're fully happy, end with a last line that says just: AGREED."* The built-in presets already do.
 5. **Press Start.** Relay sends the first session's latest answer right away. If that session hasn't answered since Relay started, its next answer goes first. To switch a flow on *without* sending the latest answer (say, you've already dealt with it), use the flow's **⋯ → Turn on without sending**. **Stop** ends a flow, and **Live / Paused** in the header pauses every flow.
 
 Want to look around before connecting real sessions? Choose **⋯ → Load demo flow**.
@@ -84,8 +84,8 @@ Relay ships with three presets:
 
 | Preset | Mode | What it does | Stops when |
 |---|---|---|---|
-| **Plan review** | Loop | One session writes the plan and the other reviews it; the review goes back for fixes | the reviewer says `LGTM` (max 6 rounds) |
-| **Plan discussion** | Loop | Two peers talk the plan through, accepting points and pushing back | either says `AGREED` (max 6 rounds) |
+| **Plan review** | Loop | One session writes the plan and the other reviews it; the review goes back for fixes | the reviewer ends with `LGTM` (max 6 rounds) |
+| **Plan discussion** | Loop | Two peers talk the plan through, accepting points and pushing back | either ends with `AGREED` (max 6 rounds) |
 | **Second opinion** | One-way | Sends an answer off for a quick check | — |
 
 You can see and rename your saved presets, or delete them, in **⋯ → Settings… → Presets**. They're stored in `~/.relay/presets.json`, so you can copy that file to share them.
@@ -153,6 +153,7 @@ This removes Relay's hook entries (and nothing else) from your Claude Code and C
 
 ```sh
 ./build.sh --open    # build into ./build and relaunch (doesn't touch ~/Applications)
+swift test           # unit tests: stop-phrase matching, prompt composition
 ```
 
 | File | What's in it |

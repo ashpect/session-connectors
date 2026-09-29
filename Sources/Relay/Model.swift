@@ -152,6 +152,21 @@ struct Flow: Identifiable, Equatable, Codable {
         set { if slot == .a { a = newValue } else { b = newValue } }
     }
 
+    /// Whether `answer` signs off with the stop phrase: its last line has to be the phrase by itself
+    /// (markdown and punctuation around it are fine). "Not AGREED", "AGREED?", or the word in the
+    /// middle of a reply don't count, so a reply that merely mentions the phrase doesn't end the flow.
+    static func signsOff(_ answer: String, with phrase: String) -> Bool {
+        let target = signOffLine(phrase)
+        guard !target.isEmpty else { return false }
+        let last = answer.split(whereSeparator: \.isNewline).map { signOffLine(String($0)) }.last { !$0.isEmpty }
+        return last?.caseInsensitiveCompare(target) == .orderedSame
+    }
+
+    private static func signOffLine(_ s: String) -> String {
+        let decoration = CharacterSet(charactersIn: "*_`~#>•·-–—:;.!\"'“”‘’()[]").union(.whitespaces)
+        return s.trimmingCharacters(in: decoration)
+    }
+
     /// An empty prompt sends the answer as-is; `{answer}` places it; otherwise it goes at the end.
     static func compose(_ template: String, answer: String) -> String {
         let t = template.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -487,7 +502,7 @@ final class RelayStore {
         guard let src = session(from), let dst = session(to) else { return }
 
         let watching = f.stopWatch == .either || (f.stopWatch == .a) == forward || !f.loop
-        if !f.stopPhrase.isEmpty, watching, answer.range(of: f.stopPhrase, options: .caseInsensitive) != nil {
+        if watching, Flow.signsOff(answer, with: f.stopPhrase) {
             withAnimation(.snappy) {
                 flows[i].halted = "\(src.kind.label) said \u{201C}\(f.stopPhrase)\u{201D}"
                 flows[i].busy = nil
