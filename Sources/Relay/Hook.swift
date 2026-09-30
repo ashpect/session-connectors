@@ -5,6 +5,7 @@ enum RelayPaths {
     static let dir = NSHomeDirectory() + "/.relay"
     static let socket = dir + "/relay.sock"
     static let state = dir + "/state.json"
+    static let presets = dir + "/presets.json"
     static let hook = dir + "/relay-hook"
     static let hookLog = dir + "/hook.log"
 }
@@ -39,7 +40,11 @@ enum HookCLI {
         let env = ProcessInfo.processInfo.environment
 
         // ITERM_SESSION_ID looks like "w0t0p1:1DF44FE5-…"; the part after the colon is iTerm's session id.
-        let pane = env["ITERM_SESSION_ID"].flatMap { $0.split(separator: ":").last.map(String.init) } ?? ""
+        // A Codex pane usually hands its turns to a shared background daemon (`codex app-server`), and
+        // hooks then inherit the daemon's environment: its ITERM_SESSION_ID belongs to whichever pane
+        // happened to start the daemon, possibly days ago. Don't pass that on; Relay works out the pane.
+        let daemon = agent == "codex" && underCodexDaemon()
+        let pane = daemon ? "" : env["ITERM_SESSION_ID"].flatMap { $0.split(separator: ":").last.map(String.init) } ?? ""
         let event: [String: Any] = [
             "agent": agent,
             "event": payload["hook_event_name"] as? String ?? "",
@@ -55,7 +60,7 @@ enum HookCLI {
         let delivered = send(data)
 
         if FileManager.default.fileExists(atPath: RelayPaths.dir + "/debug") {
-            let line = "\(Date()) \(agent) \(event["event"]!) pane=\(pane.isEmpty ? "-" : pane) tty=\(event["tty"]!) session=\(event["session"]!) delivered=\(delivered) answer=\((event["answer"] as! String).prefix(60).replacingOccurrences(of: "\n", with: " "))\n"
+            let line = "\(Date()) \(agent) \(event["event"]!) pane=\(pane.isEmpty ? "-" : pane) daemon=\(daemon) tty=\(event["tty"]!) session=\(event["session"]!) delivered=\(delivered) answer=\((event["answer"] as! String).prefix(60).replacingOccurrences(of: "\n", with: " "))\n"
             if let h = FileHandle(forWritingAtPath: RelayPaths.hookLog) ?? {
                 FileManager.default.createFile(atPath: RelayPaths.hookLog, contents: nil)
                 return FileHandle(forWritingAtPath: RelayPaths.hookLog)
@@ -66,6 +71,35 @@ enum HookCLI {
             }
         }
         exit(0)
+    }
+
+    /// Walks up from the hook's parent to the nearest `codex` process and reports whether it's the daemon.
+    private static func underCodexDaemon() -> Bool {
+        var pid = getppid()
+        for _ in 0..<8 where pid > 1 {
+            guard let (parent, args) = processInfo(pid) else { return false }
+            let words = args.split(separator: " ")
+            if let exe = words.first, (exe as NSString).lastPathComponent == "codex" || exe.hasSuffix("/codex") {
+                return words.contains("app-server")
+            }
+            pid = parent
+        }
+        return false
+    }
+
+    private static func processInfo(_ pid: pid_t) -> (parent: pid_t, args: String)? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-o", "ppid=,args=", "-p", String(pid)]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let line = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        p.waitUntilExit()
+        guard let space = line.firstIndex(of: " "), let parent = pid_t(line[..<space]) else { return nil }
+        return (parent, line[space...].trimmingCharacters(in: .whitespaces))
     }
 
     private static func controllingTTY() -> String {

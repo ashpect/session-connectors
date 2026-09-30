@@ -7,14 +7,24 @@ struct FlowCard: View {
     @Environment(RelayStore.self) private var store
     let flowID: UUID
     let number: Int
+    @State private var savingPreset = false
 
     var body: some View {
         let flow = store.binding(flowID)
         let f = flow.wrappedValue
         let a = store.session(f.a), b = store.session(f.b)
         VStack(alignment: .leading, spacing: 0) {
-            FlowHeader(flow: flow, number: number, a: a, b: b)
+            FlowHeader(flow: flow, number: number, a: a, b: b, savingPreset: $savingPreset)
                 .padding(.bottom, 10)
+            if savingPreset {
+                SavePresetRow(flowID: flowID, saving: $savingPreset)
+                    .padding(.bottom, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            } else if let applied = store.undoApply[flowID] {
+                AppliedPresetRow(name: applied.name, placement: applied.placement) { store.undoPreset(flowID) }
+                    .padding(.bottom, 10)
+                    .transition(.opacity)
+            }
             SlotView(flow: flow, slot: .a)
             if let a, let b {
                 Lanes(flow: flow, a: a, b: b)
@@ -42,22 +52,28 @@ struct FlowHeader: View {
     let number: Int
     let a: Session?
     let b: Session?
+    @Binding var savingPreset: Bool
 
     var body: some View {
         HStack(spacing: 8) {
-            SectionLabel("Flow \(number)")
-            if let a, let b {
-                HStack(spacing: 3) {
-                    AgentGlyph(kind: a.kind, size: 13)
-                    Image(systemName: flow.loop ? "arrow.left.arrow.right" : "arrow.right")
-                        .font(.system(size: 7.5, weight: .heavy))
-                        .foregroundStyle(Theme.text3)
-                    AgentGlyph(kind: b.kind, size: 13)
-                }
-            }
-            Spacer()
+            SectionLabel("Flow \(number)").fixedSize()
+            PresetMenu(flow: $flow, saving: $savingPreset)
+            Spacer(minLength: 4)
             ModeToggle(loop: $flow.loop)
+                .fixedSize()
+                .layoutPriority(1)
             Menu {
+                Button("Turn on without sending") { store.arm(flow.id) }
+                    .disabled(!flow.isComplete || (flow.enabled && flow.halted == nil))
+                if let a, let b {
+                    Button("Send \(a.kind.label)'s latest answer to \(b.kind.label)") { store.sendLatest(flow.id, from: .a) }
+                        .disabled(a.lastAnswer.isEmpty || flow.busy != nil)
+                    if flow.loop {
+                        Button("Send \(b.kind.label)'s latest answer to \(a.kind.label)") { store.sendLatest(flow.id, from: .b) }
+                            .disabled(b.lastAnswer.isEmpty || flow.busy != nil)
+                    }
+                }
+                Divider()
                 Button("Swap top and bottom") { store.swap(flow.id) }.disabled(!flow.isComplete)
                 Divider()
                 Button("Delete flow", role: .destructive) { store.removeFlow(flow.id) }
@@ -120,7 +136,8 @@ struct SlotView: View {
             if let s = store.session(flow[slot]) {
                 NodeCard(session: s, flow: $flow, slot: slot)
             } else {
-                EmptySlot(flowID: flow.id, slot: slot, other: flow[slot == .a ? .b : .a])
+                EmptySlot(flowID: flow.id, slot: slot, other: flow[slot == .a ? .b : .a],
+                          role: slot == .a ? flow.roleA : flow.roleB)
             }
         }
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Theme.live, lineWidth: 1.5).opacity(targeted ? 1 : 0))
@@ -171,10 +188,21 @@ struct NodeCard: View {
                             .onTapGesture(count: 2, perform: startRename)
                             .help("Double-click to rename")
                     }
-                    Text(subtitle(answering: answering))
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(busy ? tint : Theme.text3)
-                        .lineLimit(1)
+                    HStack(spacing: 5) {
+                        if let role = slot == .a ? flow.roleA : flow.roleB {
+                            Text(role.uppercased())
+                                .font(.system(size: 8.5, weight: .bold))
+                                .tracking(0.5)
+                                .foregroundStyle(tint)
+                                .padding(.horizontal, 4).padding(.vertical, 1)
+                                .background(Capsule().fill(tint.opacity(0.18)))
+                                .fixedSize()
+                        }
+                        Text(subtitle(answering: answering))
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(busy ? tint : Theme.text3)
+                            .lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 4)
                 IconButton(symbol: peeking ? "eye.fill" : "eye", help: "Peek at the pane", active: peeking) {
@@ -249,9 +277,11 @@ struct EmptySlot: View {
     let flowID: UUID
     let slot: Flow.Slot
     let other: String?
+    var role: String?
 
     var body: some View {
         let candidates = store.sessions.filter { $0.id != other }
+        let ask = role.map { "Pick the \($0.lowercased())" } ?? (slot == .a ? "Pick the first session" : "Pick where its answer goes")
         let waiting = store.pickTarget?.flow == flowID && store.pickTarget?.slot == slot
         HStack(spacing: 10) {
             ZStack {
@@ -262,7 +292,7 @@ struct EmptySlot: View {
             }
             .frame(width: 30, height: 30)
             VStack(alignment: .leading, spacing: 2) {
-                Text(waiting ? "Now click a pane in iTerm" : (slot == .a ? "Pick the first session" : "Pick where its answer goes"))
+                Text(waiting ? "Now click a pane in iTerm" : ask)
                     .font(.system(size: 12.5, weight: .semibold))
                 Text(waiting ? "right-click cancels" : "Click here, then click a pane · or drag a session in")
                     .font(.system(size: 10.5))
@@ -562,13 +592,15 @@ struct FlowFooter: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             Rectangle().fill(Theme.stroke).frame(height: 1)
+            // Several phrases ("APPROVED, NEEDS HUMAN") don't fit beside the labels, so they get their own line.
+            let wide = flow.stopPhrase.count > 12
             HStack(spacing: 6) {
                 FieldLabel(text: "Stop when")
                 if flow.loop {
                     Menu {
-                        Button("either says") { flow.stopWatch = .either }
-                        Button("\(a.kind.label) says") { flow.stopWatch = .a }
-                        Button("\(b.kind.label) says") { flow.stopWatch = .b }
+                        Button("either") { flow.stopWatch = .either }
+                        Button(a.kind.label) { flow.stopWatch = .a }
+                        Button(b.kind.label) { flow.stopWatch = .b }
                     } label: {
                         Text(watchLabel).font(.system(size: 11, weight: .semibold))
                     }
@@ -577,13 +609,9 @@ struct FlowFooter: View {
                 } else {
                     Text(a.kind.label).font(.system(size: 11, weight: .semibold))
                 }
-                FieldLabel(text: "says")
-                TextField("LGTM", text: $flow.stopPhrase)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(FieldBackground())
-                    .frame(maxWidth: 110)
+                FieldLabel(text: "ends with")
+                    .help("Only a last line that's just this phrase counts, so \u{201C}Not \(Flow.phrases(flow.stopPhrase).first ?? "LGTM")\u{201D} won't stop the flow. Ask for it that way in your prompt.")
+                if !wide { stopField }
                 Spacer(minLength: 4)
                 Menu {
                     ForEach([3, 5, 10, 20, 50], id: \.self) { n in
@@ -597,12 +625,23 @@ struct FlowFooter: View {
                 .foregroundStyle(Theme.text2)
                 .help("Stop after this many rounds, whatever they say")
             }
+            if wide { stopField }
             HStack(spacing: 8) {
                 FlowStatus(flow: flow, a: a, b: b)
                 Spacer(minLength: 6)
                 RunButton(flow: flow)
             }
         }
+    }
+
+    private var stopField: some View {
+        TextField("LGTM", text: $flow.stopPhrase)
+            .textFieldStyle(.plain)
+            .font(.system(size: 11.5, design: .monospaced))
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(FieldBackground())
+            .frame(minWidth: 60, maxWidth: .infinity)
+            .help("Separate alternatives with a comma. The first finishes the flow; any other hands it back to you, e.g. APPROVED, NEEDS HUMAN")
     }
 
     private var watchLabel: String {
@@ -621,9 +660,31 @@ struct FlowStatus: View {
     let b: Session
 
     var body: some View {
+        if let until = flow.pendingUntil, let to = store.session(flow.pendingTo), store.running, flow.halted == nil {
+            // Waiting out the send delay from Settings.
+            TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                HStack(spacing: 5) {
+                    Image(systemName: "timer")
+                    Text("Sending to \(to.kind.label) in \(max(0, Int(until.timeIntervalSince(ctx.date).rounded(.up))))s")
+                        .monospacedDigit()
+                        .lineLimit(1)
+                    Button("Send now") { store.sendNow(flow.id) }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(to.kind.tint)
+                }
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(Theme.text2)
+            }
+        } else {
+            status
+        }
+    }
+
+    @ViewBuilder private var status: some View {
         let busy = store.session(flow.busy)
         let (icon, text, color): (String, String, Color) =
             if !store.running { ("pause.circle.fill", "Relay is paused", Theme.paused) }
+            else if let halted = flow.halted, flow.needsYou { ("hand.raised.fill", "Needs you · \(halted)", Theme.paused) }
             else if let halted = flow.halted { ("checkmark.seal.fill", "Done in \(flow.rounds) round\(flow.rounds == 1 ? "" : "s") · \(halted)", Theme.live) }
             else if let busy { ("ellipsis.circle.fill", "Round \(flow.rounds) · \(busy.kind.label) is replying", busy.kind.tint) }
             else if flow.enabled && flow.rounds > 0 { ("arrow.triangle.2.circlepath", "Round \(flow.rounds) · waiting for the next answer", Theme.text2) }
@@ -691,5 +752,115 @@ struct NewFlowButton: View {
             .buttonStyle(.plain)
             .foregroundStyle(Theme.text2)
         }
+    }
+}
+
+// MARK: - Presets
+
+/// The book menu on each flow: fill it from a preset, or save its setup as one.
+struct PresetMenu: View {
+    @Environment(RelayStore.self) private var store
+    @Binding var flow: Flow
+    @Binding var saving: Bool
+
+    var body: some View {
+        let current = store.preset(flow.presetID)
+        let edited = current.map { !$0.matches(flow) } ?? false
+        Menu {
+            ForEach(Preset.builtInGroups, id: \.title) { group in
+                Section(group.title) {
+                    ForEach(group.presets) { p in
+                        Button(p.name) { store.apply(p, to: flow.id) }
+                    }
+                }
+            }
+            if !store.presets.isEmpty {
+                Section("Saved") {
+                    ForEach(store.presets) { p in
+                        Button(p.name) { store.apply(p, to: flow.id) }
+                    }
+                }
+            }
+            Divider()
+            if let current, !current.builtIn, edited {
+                Button("Update \u{201C}\(current.name)\u{201D} with this setup") { store.updatePreset(current.id, from: flow.id) }
+            }
+            Button("Save as preset…") { withAnimation(.snappy) { saving = true } }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "text.book.closed").font(.system(size: 9.5, weight: .semibold))
+                Text(current.map { Self.short($0.name) + (edited ? " •" : "") } ?? "Presets")
+                    .lineLimit(1)
+            }
+            .font(.system(size: 10.5, weight: .semibold))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.visible)
+        .fixedSize()
+        .foregroundStyle(current == nil ? Theme.text2 : Theme.text1)
+        .help(current.map { edited ? "\($0.name), edited since you applied it" : ($0.note.isEmpty ? $0.name : $0.note) }
+              ?? "Fill this flow from a preset, or save its setup as one")
+    }
+
+    private static func short(_ name: String) -> String {
+        name.count > 13 ? String(name.prefix(12)) + "…" : name
+    }
+}
+
+struct SavePresetRow: View {
+    @Environment(RelayStore.self) private var store
+    let flowID: UUID
+    @Binding var saving: Bool
+    @State private var name = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "text.book.closed").font(.system(size: 11)).foregroundStyle(Theme.live)
+            TextField("Name this preset", text: $name)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .focused($focused)
+                .onSubmit(save)
+                .onExitCommand { saving = false }
+            Button("Save", action: save)
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.live)
+            Button("Cancel") { withAnimation(.snappy) { saving = false } }
+                .buttonStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.text3)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.black.opacity(0.25)))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Theme.live.opacity(0.4)))
+        .onAppear { DispatchQueue.main.async { focused = true } }
+    }
+
+    private func save() {
+        store.savePreset(from: flowID, name: name)
+        withAnimation(.snappy) { saving = false }
+    }
+}
+
+struct AppliedPresetRow: View {
+    let name: String
+    let placement: String?
+    let undo: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.live)
+            Text("Applied \u{201C}\(name)\u{201D}" + (placement.map { " · \($0)" } ?? ""))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 4)
+            Button("Undo", action: undo).buttonStyle(.plain).foregroundStyle(Theme.text1).fontWeight(.semibold)
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(Theme.text2)
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Theme.live.opacity(0.1)))
     }
 }

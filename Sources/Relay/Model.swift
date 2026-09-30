@@ -130,16 +130,22 @@ struct Flow: Identifiable, Equatable, Codable {
     var stopWatch = Watch.either
     var maxRounds = 10
     var enabled = false       // on after Start; answers only move while a flow is on
+    var presetID: String?     // the preset this flow was set up from, if any
+    var roleA: String?        // what each side is in that setup ("Reviewer", "Author"), shown on the slots
+    var roleB: String?
 
     var rounds = 0            // A → B sends in this run
     var backSends = 0
     var halted: String?
+    var needsYou = false      // it stopped without finishing: a hand-off phrase, the round limit, or a failed send
     var busy: String?         // the session currently answering something this flow sent it
+    var pendingUntil: Date?   // an answer is waiting out the send delay until then…
+    var pendingTo: String?    // …on its way to this session
     var forwardPulse = 0
     var backPulse = 0
 
     private enum CodingKeys: String, CodingKey {
-        case id, a, b, forward, back, loop, stopPhrase, stopWatch, maxRounds
+        case id, a, b, forward, back, loop, stopPhrase, stopWatch, maxRounds, presetID, roleA, roleB
     }
 
     var isComplete: Bool { a != nil && b != nil }
@@ -147,6 +153,33 @@ struct Flow: Identifiable, Equatable, Codable {
     subscript(slot: Slot) -> String? {
         get { slot == .a ? a : b }
         set { if slot == .a { a = newValue } else { b = newValue } }
+    }
+
+    /// Whether `answer` signs off with the stop phrase: its last line has to be the phrase by itself
+    /// (markdown and punctuation around it are fine). "Not AGREED", "AGREED?", or the word in the
+    /// middle of a reply don't count, so a reply that merely mentions the phrase doesn't end the flow.
+    static func signsOff(_ answer: String, with phrase: String) -> Bool {
+        signOff(answer, phrases: phrase) != nil
+    }
+
+    /// A flow can have more than one stop phrase, separated by commas: "APPROVED, NEEDS HUMAN".
+    /// The first is the normal finish; the rest hand the decision back to you.
+    static func phrases(_ stopPhrase: String) -> [String] {
+        stopPhrase.split(whereSeparator: { $0 == "," || $0 == "|" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !signOffLine($0).isEmpty }
+    }
+
+    /// The stop phrase `answer` signs off with, if any.
+    static func signOff(_ answer: String, phrases stopPhrase: String) -> String? {
+        guard let last = answer.split(whereSeparator: \.isNewline).map({ signOffLine(String($0)) }).last(where: { !$0.isEmpty })
+        else { return nil }
+        return phrases(stopPhrase).first { signOffLine($0).caseInsensitiveCompare(last) == .orderedSame }
+    }
+
+    private static func signOffLine(_ s: String) -> String {
+        let decoration = CharacterSet(charactersIn: "*_`~#>•·-–—:;.!\"'“”‘’()[]").union(.whitespaces)
+        return s.trimmingCharacters(in: decoration)
     }
 
     /// An empty prompt sends the answer as-is; `{answer}` places it; otherwise it goes at the end.
@@ -159,7 +192,7 @@ struct Flow: Identifiable, Equatable, Codable {
 }
 
 struct LogEntry: Identifiable {
-    enum Kind { case send, stop, info }
+    enum Kind { case send, stop, warn, info }
     let id = UUID()
     let date = Date()
     let kind: Kind
@@ -186,6 +219,10 @@ final class RelayStore {
     var flashID: String?
     var peeking: Set<String> = []
     var inFlight = 0
+    var showingSettings = false
+    var presets: [Preset] = []                  // the ones you saved; built-ins live in Preset.builtIns
+    var undoApply: [UUID: AppliedPreset] = [:]  // lets you take back applying a preset for a few seconds
+    var sendDelay = 0.0       // seconds to wait after an answer before pasting it into the next session
 
     var simulating: Bool { inFlight > 0 }
 
@@ -200,6 +237,8 @@ final class RelayStore {
     @ObservationIgnored private var outbox: [String: [String]] = [:]       // waiting for a busy pane
     @ObservationIgnored private var lastStop: [String: String] = [:]
     @ObservationIgnored private var lastSaved = Data()
+    @ObservationIgnored private var pendingWork: [UUID: () -> Void] = [:]
+    @ObservationIgnored private var persists = false   // only the real app (not --snapshot renders) writes state
 
     func session(_ id: String?) -> Session? { id.flatMap { id in sessions.first { $0.id == id } } }
 
@@ -306,6 +345,8 @@ final class RelayStore {
             flows[i].b = f.a
             flows[i].forward = f.back
             flows[i].back = f.forward
+            flows[i].roleA = f.roleB
+            flows[i].roleB = f.roleA
             flows[i].stopWatch = f.stopWatch == .a ? .b : (f.stopWatch == .b ? .a : .either)
         }
     }
@@ -314,7 +355,11 @@ final class RelayStore {
         flows[i].rounds = 0
         flows[i].backSends = 0
         flows[i].halted = nil
+        flows[i].needsYou = false
         flows[i].busy = nil
+        flows[i].pendingUntil = nil
+        flows[i].pendingTo = nil
+        pendingWork[flows[i].id] = nil
     }
 
     /// Turns the flow on. If A has an answer already (and isn't mid-turn), it goes down right away;
@@ -339,13 +384,138 @@ final class RelayStore {
         }
     }
 
+    /// Picks a flow up where it left off: turns it on and sends that session's latest answer across.
+    func sendLatest(_ flowID: UUID, from slot: Flow.Slot) {
+        guard let i = index(of: flowID), let id = flows[i][slot], let src = session(id), !src.lastAnswer.isEmpty else { return }
+        guard running else { notice = "Relay is paused. Press Paused to go live."; return }
+        withAnimation(.snappy) {
+            flows[i].halted = nil
+            flows[i].needsYou = false
+            flows[i].enabled = true
+            if flows[i].rounds >= flows[i].maxRounds { flows[i].rounds = 0 }
+        }
+        note(.info, from: src.kind, "Resumed · sending \(src.kind.label)'s latest answer")
+        sessionFinished(id, answer: src.lastAnswer, only: flowID)
+    }
+
+    /// Turns the flow on without sending anything now; the first session's next answer starts it.
+    func arm(_ flowID: UUID) {
+        guard let i = index(of: flowID), let src = session(flows[i].a), let dst = session(flows[i].b) else { return }
+        withAnimation(.snappy) {
+            resetRun(i)
+            flows[i].enabled = true
+        }
+        note(.info, from: src.kind, to: dst.kind, "On · \(src.kind.label)'s next answer goes to \(dst.kind.label)")
+    }
+
     func stop(_ flowID: UUID) {
         guard let i = index(of: flowID) else { return }
         withAnimation(.snappy) {
             flows[i].enabled = false
             flows[i].busy = nil
+            flows[i].pendingUntil = nil
+            flows[i].pendingTo = nil
         }
+        pendingWork[flowID] = nil
         note(.info, "Stopped a flow")
+    }
+
+    // MARK: Presets
+
+    struct AppliedPreset: Equatable {
+        let before: Flow
+        let name: String
+        let placement: String?
+    }
+
+    var allPresets: [Preset] { Preset.builtIns + presets }
+
+    func preset(_ id: String?) -> Preset? { id.flatMap { id in allPresets.first { $0.id == id } } }
+
+    /// Fills the flow with a preset's mode, prompts, and stop rule. Sessions stay as they are.
+    func apply(_ p: Preset, to flowID: UUID) {
+        guard let i = index(of: flowID) else { return }
+        let before = flows[i]
+        withAnimation(.snappy) {
+            flows[i].loop = p.loop
+            flows[i].forward = p.forward
+            flows[i].back = p.back
+            flows[i].stopPhrase = p.stopPhrase
+            flows[i].stopWatch = p.stopWatch
+            flows[i].maxRounds = p.maxRounds
+            flows[i].presetID = p.id
+            flows[i].roleA = p.roleA
+            flows[i].roleB = p.roleB
+            undoApply[flowID] = AppliedPreset(before: before, name: p.name, placement: p.placement)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, undoApply[flowID]?.before == before else { return }
+            withAnimation(.snappy) { self.undoApply[flowID] = nil }
+        }
+    }
+
+    func undoPreset(_ flowID: UUID) {
+        guard let i = index(of: flowID), let u = undoApply[flowID] else { return }
+        withAnimation(.snappy) {
+            flows[i].loop = u.before.loop
+            flows[i].forward = u.before.forward
+            flows[i].back = u.before.back
+            flows[i].stopPhrase = u.before.stopPhrase
+            flows[i].stopWatch = u.before.stopWatch
+            flows[i].maxRounds = u.before.maxRounds
+            flows[i].presetID = u.before.presetID
+            flows[i].roleA = u.before.roleA
+            flows[i].roleB = u.before.roleB
+            undoApply[flowID] = nil
+        }
+    }
+
+    func savePreset(from flowID: UUID, name: String) {
+        guard let i = index(of: flowID) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let p = Preset(from: flows[i], name: trimmed.isEmpty ? "My preset" : trimmed)
+        withAnimation(.snappy) {
+            presets.append(p)
+            flows[i].presetID = p.id
+        }
+        savePresets()
+        note(.info, "Saved preset \u{201C}\(p.name)\u{201D}")
+    }
+
+    /// Overwrites a saved preset with the flow's current settings.
+    func updatePreset(_ id: String, from flowID: UUID) {
+        guard let i = index(of: flowID), let j = presets.firstIndex(where: { $0.id == id }) else { return }
+        var p = Preset(from: flows[i], name: presets[j].name)
+        p.id = id
+        p.note = presets[j].note
+        presets[j] = p
+        savePresets()
+    }
+
+    func renamePreset(_ id: String, to name: String) {
+        guard let j = presets.firstIndex(where: { $0.id == id }) else { return }
+        presets[j].name = name
+        savePresets()
+    }
+
+    func deletePreset(_ id: String) {
+        withAnimation(.snappy) { presets.removeAll { $0.id == id } }
+        savePresets()
+    }
+
+    func loadPresets() {
+        guard let data = FileManager.default.contents(atPath: RelayPaths.presets),
+              let saved = try? JSONDecoder().decode([Preset].self, from: data) else { return }
+        presets = saved.filter { !$0.builtIn }
+    }
+
+    private func savePresets() {
+        guard persists else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(presets) else { return }
+        try? FileManager.default.createDirectory(atPath: RelayPaths.dir, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: RelayPaths.presets, contents: data)
     }
 
     // MARK: Engine
@@ -369,23 +539,62 @@ final class RelayStore {
         guard let src = session(from), let dst = session(to) else { return }
 
         let watching = f.stopWatch == .either || (f.stopWatch == .a) == forward || !f.loop
-        if !f.stopPhrase.isEmpty, watching, answer.range(of: f.stopPhrase, options: .caseInsensitive) != nil {
+        if watching, let phrase = Flow.signOff(answer, phrases: f.stopPhrase) {
+            // The first phrase is the finish line; any other one hands the decision to you.
+            let handoff = phrase != Flow.phrases(f.stopPhrase).first
+            let rounds = "\(f.rounds) round\(f.rounds == 1 ? "" : "s")"
             withAnimation(.snappy) {
-                flows[i].halted = "\(src.kind.label) said \u{201C}\(f.stopPhrase)\u{201D}"
+                flows[i].halted = "\(src.kind.label) said \u{201C}\(phrase)\u{201D}"
+                flows[i].needsYou = handoff
                 flows[i].busy = nil
             }
-            note(.stop, from: src.kind, "\(src.kind.label) said \u{201C}\(f.stopPhrase)\u{201D} · done in \(f.rounds) round\(f.rounds == 1 ? "" : "s")")
+            note(handoff ? .warn : .stop, from: src.kind,
+                 "\(src.kind.label) said \u{201C}\(phrase)\u{201D} · \(handoff ? "needs you after" : "done in") \(rounds)")
             return
         }
         if forward, f.rounds >= f.maxRounds {
             withAnimation(.snappy) {
                 flows[i].halted = "Hit the \(f.maxRounds)-round limit"
+                flows[i].needsYou = true
                 flows[i].busy = nil
             }
-            note(.stop, from: src.kind, "Stopped after \(f.maxRounds) rounds")
+            note(.warn, from: src.kind, "Stopped after \(f.maxRounds) rounds without a sign-off")
             return
         }
 
+        let message = Flow.compose(forward ? f.forward : f.back, answer: answer)
+        let flowID = f.id
+        let work = { [weak self] in
+            guard let self, let j = index(of: flowID), flows[j].enabled, flows[j].halted == nil, running else { return }
+            pendingWork[flowID] = nil
+            withAnimation(.snappy) {
+                self.flows[j].pendingUntil = nil
+                self.flows[j].pendingTo = nil
+            }
+            commit(j, from: src, to: dst, forward: forward, answer: answer, message: message)
+        }
+        guard sendDelay > 0 else { return work() }
+
+        // Wait out the delay first. A newer answer replaces the waiting one; Stop cancels it.
+        let fire = Date().addingTimeInterval(sendDelay)
+        pendingWork[flowID] = work
+        withAnimation(.snappy) {
+            flows[i].pendingUntil = fire
+            flows[i].pendingTo = to
+        }
+        note(.info, from: src.kind, to: dst.kind, "Sending to \(dst.kind.label) in \(Int(sendDelay))s")
+        DispatchQueue.main.asyncAfter(deadline: .now() + sendDelay) { [weak self] in
+            guard let self, let j = index(of: flowID), flows[j].pendingUntil == fire else { return }
+            pendingWork[flowID]?()
+        }
+    }
+
+    /// Skip the rest of the send delay.
+    func sendNow(_ flowID: UUID) {
+        pendingWork[flowID]?()
+    }
+
+    private func commit(_ i: Int, from src: Session, to dst: Session, forward: Bool, answer: String, message: String) {
         if forward {
             flows[i].rounds += 1
             flows[i].forwardPulse += 1
@@ -393,14 +602,13 @@ final class RelayStore {
             flows[i].backSends += 1
             flows[i].backPulse += 1
         }
-        let message = Flow.compose(forward ? f.forward : f.back, answer: answer)
         note(.send, from: src.kind, to: dst.kind, "\(Demo.gist(answer)) · \(message.count.formatted()) chars")
-        withAnimation(.snappy) { flows[i].busy = to }
-        flash(to)
+        withAnimation(.snappy) { flows[i].busy = dst.id }
+        flash(dst.id)
         if dst.isDemo {
-            simulateReply(from: to, flowID: f.id)
+            simulateReply(from: dst.id, flowID: flows[i].id)
         } else {
-            send(message, to: to)
+            send(message, to: dst.id)
         }
     }
 
@@ -444,6 +652,7 @@ final class RelayStore {
         for i in flows.indices where flows[i].busy == pane {
             withAnimation(.snappy) {
                 flows[i].halted = reason
+                flows[i].needsYou = true
                 flows[i].busy = nil
             }
         }
@@ -481,23 +690,31 @@ final class RelayStore {
     }
 
     /// Which docked pane an event belongs to. Claude's hooks run inside the pane, so they carry its
-    /// id. Codex runs turns in a background daemon, so for Codex we match the thread to a pane once
-    /// (by what we pasted, the folder, or text on screen) and remember it.
+    /// id. Codex usually runs turns in a background daemon, so a Codex thread is matched to its pane
+    /// (by the text we pasted, the folder, or what's on screen) and the match is remembered.
     private func resolvePane(_ e: HookEvent, completion: @escaping (String?) -> Void) {
-        if !e.pane.isEmpty { return completion(e.pane) }
-        if let p = threadPanes[e.session] { return completion(p) }
+        if e.agent != "codex", !e.pane.isEmpty { return completion(e.pane) }
         func remember(_ pane: String?) {
             if let pane, !e.session.isEmpty { threadPanes[e.session] = pane }
             completion(pane)
         }
-        if !e.tty.isEmpty, let s = sessions.first(where: { $0.tty == e.tty }) { return remember(s.id) }
+        // We typed this exact prompt into a pane a moment ago: strongest evidence there is.
         if e.event == "UserPromptSubmit", !e.prompt.isEmpty {
-            let key = Self.normalize(e.prompt)
-            if let hit = awaiting.first(where: { Self.normalize($0.value.text) == key }) { return remember(hit.key) }
+            let key = String(Self.normalize(e.prompt).prefix(160))
+            if let hit = awaiting.first(where: { String(Self.normalize($0.value.text).prefix(160)) == key }) {
+                return remember(hit.key)
+            }
         }
+        if let p = threadPanes[e.session] { return completion(p) }
+        if !e.pane.isEmpty, session(e.pane)?.kind == .codex { return remember(e.pane) }
+        if !e.tty.isEmpty, let s = sessions.first(where: { $0.tty == e.tty }) { return remember(s.id) }
 
         // Look across every iTerm pane (docked or not) running this agent in this folder.
-        let snippet = String(Self.normalize(e.event == "Stop" ? e.answer : e.prompt).prefix(40))
+        // A finished answer's end is what's visible on screen; a fresh prompt's start is.
+        let lastLine = e.answer.split(whereSeparator: \.isNewline).last { !Self.normalize(String($0)).isEmpty }.map(String.init) ?? ""
+        let snippet = e.event == "Stop"
+            ? String(Self.normalize(lastLine).suffix(40))
+            : String(Self.normalize(e.prompt).prefix(40))
         let kind = AgentKind(rawValue: e.agent) ?? .shell
         ITerm.allSessions { [weak self] result in
             guard let self, case .success(let all) = result else { return completion(nil) }
@@ -520,7 +737,7 @@ final class RelayStore {
 
     private static func normalize(_ s: String) -> String {
         s.lowercased()
-            .replacingOccurrences(of: #"[*_`#>•›⏺]"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"[*_`#>•›⏺│|\-]"#, with: "", options: .regularExpression)
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
     }
@@ -626,38 +843,51 @@ final class RelayStore {
         var sessions: [Session]
         var flows: [Flow]
         var threadPanes: [String: String]
+        var sendDelay: Double?
+        var fadeWhenIdle: Bool?
+        var opacity: Double?
     }
 
     func load() {
+        loadPresets()
         guard let data = FileManager.default.contents(atPath: RelayPaths.state),
               let saved = try? JSONDecoder().decode(Saved.self, from: data) else { return }
         sessions = saved.sessions
         flows = saved.flows.isEmpty ? [Flow()] : saved.flows
         threadPanes = saved.threadPanes
+        sendDelay = saved.sendDelay ?? 0
+        fadeWhenIdle = saved.fadeWhenIdle ?? true
+        opacity = saved.opacity ?? 1
         lastSaved = data
     }
 
     func startSaving() {
+        persists = true
         saveTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.save() }
     }
 
     func save() {
+        guard persists else { return }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(Saved(sessions: sessions, flows: flows, threadPanes: threadPanes)),
+        let saved = Saved(sessions: sessions, flows: flows, threadPanes: threadPanes,
+                          sendDelay: sendDelay, fadeWhenIdle: fadeWhenIdle, opacity: opacity)
+        guard let data = try? encoder.encode(saved),
               data != lastSaved else { return }
         try? FileManager.default.createDirectory(atPath: RelayPaths.dir, withIntermediateDirectories: true)
         if FileManager.default.createFile(atPath: RelayPaths.state, contents: data) { lastSaved = data }
     }
 
+    static func hookInstalled(_ agent: AgentKind) -> Bool {
+        let path = NSHomeDirectory() + (agent == .claude ? "/.claude/settings.json" : "/.codex/hooks.json")
+        return (try? String(contentsOfFile: path, encoding: .utf8))?.contains(RelayPaths.hook) ?? false
+    }
+
     /// Relay only hears about turns through hooks in Claude Code and Codex; say so if they're missing.
     func checkHooks() {
-        func has(_ path: String) -> Bool {
-            (try? String(contentsOfFile: path, encoding: .utf8))?.contains(RelayPaths.hook) ?? false
-        }
         var missing: [String] = []
-        if !has(NSHomeDirectory() + "/.claude/settings.json") { missing.append("Claude Code") }
-        if !has(NSHomeDirectory() + "/.codex/hooks.json") { missing.append("Codex") }
+        if !Self.hookInstalled(.claude) { missing.append("Claude Code") }
+        if !Self.hookInstalled(.codex) { missing.append("Codex") }
         if !missing.isEmpty {
             notice = "Relay's hooks aren't installed in \(missing.joined(separator: " or ")), so it can't hear when their turns end."
         }
@@ -673,12 +903,18 @@ final class RelayStore {
                             tty: "/dev/ttys001", path: NSHomeDirectory() + "/code/api-gateway",
                             screen: Demo.codexScreen, isDemo: true)
         for s in [claude, codex] where session(s.id) == nil { sessions.append(s) }
+        // The demo runs the built-in Plan review preset with canned replies.
+        let preset = Preset.planReview
         var flow = Flow(a: claude.id, b: codex.id)
-        flow.forward = "Review the updated plan. List blocking issues first, then nits. Say LGTM if nothing is blocking."
-        flow.back = "Codex reviewed your plan:\n\n{answer}\n\nFix the blocking issues and update PLAN.md."
-        flow.loop = true
-        flow.stopPhrase = "LGTM"
-        flow.stopWatch = .b
+        flow.forward = preset.forward
+        flow.back = preset.back
+        flow.loop = preset.loop
+        flow.stopPhrase = preset.stopPhrase
+        flow.stopWatch = preset.stopWatch
+        flow.maxRounds = preset.maxRounds
+        flow.presetID = preset.id
+        flow.roleA = preset.roleA
+        flow.roleB = preset.roleB
         withAnimation(.snappy) {
             flows.removeAll { !$0.isComplete }
             flows.insert(flow, at: 0)
@@ -694,7 +930,7 @@ enum Demo {
         case .codex:
             return turn < 2
                 ? "Review of rev \(turn): 2 blocking. (1) The Redis keys have no TTL, so idle tenants leak memory. (2) Limits are re-read on every request instead of cached. 1 nit: name the config flag."
-                : "Review of rev \(turn): nothing blocking left. Nit: document the Retry-After header. LGTM."
+                : "Review of rev \(turn): nothing blocking left. Nit: document the Retry-After header.\n\nLGTM"
         case .shell:
             return "exit 0"
         }
@@ -704,7 +940,9 @@ enum Demo {
     static func gist(_ s: String) -> String {
         let plain = s.replacingOccurrences(of: #"[*_`#>]"#, with: "", options: .regularExpression)
         let line = plain.split(whereSeparator: \.isNewline).first.map(String.init) ?? plain
-        let sentence = line.range(of: ". ").map { String(line[..<$0.lowerBound]) } ?? line
+        // Cut at the first sentence end, but not inside a list marker like "1. " at the very start.
+        let from = line.index(line.startIndex, offsetBy: min(12, line.count))
+        let sentence = line.range(of: ". ", range: from..<line.endIndex).map { String(line[..<$0.lowerBound]) } ?? line
         let t = sentence.trimmingCharacters(in: .whitespaces)
         return t.count > 44 ? String(t.prefix(44)) + "…" : t
     }

@@ -26,6 +26,9 @@ struct RootView: View {
             if store.pick != .idle { PickBanner() }
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if store.showingSettings {
+                        SettingsView()
+                    } else {
                     if store.sessions.isEmpty {
                         Intro()
                     } else {
@@ -42,6 +45,7 @@ struct RootView: View {
                             .font(.system(size: 11))
                             .foregroundStyle(Theme.text3)
                             .frame(maxWidth: .infinity)
+                    }
                     }
                 }
                 .padding(.horizontal, 14)
@@ -92,17 +96,11 @@ struct HeaderBar: View {
             .help("Pick up a session (⌥⌘P)")
 
             Menu {
-                Button("New flow") { store.addFlow() }
-                Button("Load demo flow") { store.loadDemo() }
-                Divider()
-                Toggle("Fade when not hovered", isOn: $store.fadeWhenIdle)
-                Picker("Opacity", selection: $store.opacity) {
-                    Text("100%").tag(1.0)
-                    Text("85%").tag(0.85)
-                    Text("70%").tag(0.7)
-                }
-                Divider()
+                Button("New flow") { store.showingSettings = false; store.addFlow() }
+                Button("Load demo flow") { store.showingSettings = false; store.loadDemo() }
                 Button("Clear activity") { store.log.removeAll() }
+                Divider()
+                Button("Settings…") { withAnimation(.snappy) { store.showingSettings = true } }
                 Divider()
                 Button("Pick a pane  ⌥⌘P") { store.picker?.begin() }
                 Button("Hide Relay  ⌃⌥K") { store.togglePanel?() }
@@ -468,7 +466,7 @@ struct LogLine: View {
             }
             Text(entry.text)
                 .font(.system(size: 10.5))
-                .foregroundStyle(entry.kind == .stop ? Theme.live : (entry.kind == .send ? Theme.text1 : Theme.text2))
+                .foregroundStyle(entry.kind == .stop ? Theme.live : entry.kind == .warn ? Theme.paused : entry.kind == .send ? Theme.text1 : Theme.text2)
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
