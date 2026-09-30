@@ -21,7 +21,7 @@ struct FlowCard: View {
                     .padding(.bottom, 10)
                     .transition(.move(edge: .top).combined(with: .opacity))
             } else if let applied = store.undoApply[flowID] {
-                AppliedPresetRow(name: applied.name) { store.undoPreset(flowID) }
+                AppliedPresetRow(name: applied.name, placement: applied.placement) { store.undoPreset(flowID) }
                     .padding(.bottom, 10)
                     .transition(.opacity)
             }
@@ -56,7 +56,7 @@ struct FlowHeader: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            SectionLabel("Flow \(number)")
+            SectionLabel("Flow \(number)").fixedSize()
             PresetMenu(flow: $flow, saving: $savingPreset)
             Spacer(minLength: 4)
             ModeToggle(loop: $flow.loop)
@@ -136,7 +136,8 @@ struct SlotView: View {
             if let s = store.session(flow[slot]) {
                 NodeCard(session: s, flow: $flow, slot: slot)
             } else {
-                EmptySlot(flowID: flow.id, slot: slot, other: flow[slot == .a ? .b : .a])
+                EmptySlot(flowID: flow.id, slot: slot, other: flow[slot == .a ? .b : .a],
+                          role: slot == .a ? flow.roleA : flow.roleB)
             }
         }
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Theme.live, lineWidth: 1.5).opacity(targeted ? 1 : 0))
@@ -187,10 +188,21 @@ struct NodeCard: View {
                             .onTapGesture(count: 2, perform: startRename)
                             .help("Double-click to rename")
                     }
-                    Text(subtitle(answering: answering))
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(busy ? tint : Theme.text3)
-                        .lineLimit(1)
+                    HStack(spacing: 5) {
+                        if let role = slot == .a ? flow.roleA : flow.roleB {
+                            Text(role.uppercased())
+                                .font(.system(size: 8.5, weight: .bold))
+                                .tracking(0.5)
+                                .foregroundStyle(tint)
+                                .padding(.horizontal, 4).padding(.vertical, 1)
+                                .background(Capsule().fill(tint.opacity(0.18)))
+                                .fixedSize()
+                        }
+                        Text(subtitle(answering: answering))
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(busy ? tint : Theme.text3)
+                            .lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 4)
                 IconButton(symbol: peeking ? "eye.fill" : "eye", help: "Peek at the pane", active: peeking) {
@@ -265,9 +277,11 @@ struct EmptySlot: View {
     let flowID: UUID
     let slot: Flow.Slot
     let other: String?
+    var role: String?
 
     var body: some View {
         let candidates = store.sessions.filter { $0.id != other }
+        let ask = role.map { "Pick the \($0.lowercased())" } ?? (slot == .a ? "Pick the first session" : "Pick where its answer goes")
         let waiting = store.pickTarget?.flow == flowID && store.pickTarget?.slot == slot
         HStack(spacing: 10) {
             ZStack {
@@ -278,7 +292,7 @@ struct EmptySlot: View {
             }
             .frame(width: 30, height: 30)
             VStack(alignment: .leading, spacing: 2) {
-                Text(waiting ? "Now click a pane in iTerm" : (slot == .a ? "Pick the first session" : "Pick where its answer goes"))
+                Text(waiting ? "Now click a pane in iTerm" : ask)
                     .font(.system(size: 12.5, weight: .semibold))
                 Text(waiting ? "right-click cancels" : "Click here, then click a pane · or drag a session in")
                     .font(.system(size: 10.5))
@@ -578,6 +592,8 @@ struct FlowFooter: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             Rectangle().fill(Theme.stroke).frame(height: 1)
+            // Several phrases ("APPROVED, NEEDS HUMAN") don't fit beside the labels, so they get their own line.
+            let wide = flow.stopPhrase.count > 12
             HStack(spacing: 6) {
                 FieldLabel(text: "Stop when")
                 if flow.loop {
@@ -594,13 +610,8 @@ struct FlowFooter: View {
                     Text(a.kind.label).font(.system(size: 11, weight: .semibold))
                 }
                 FieldLabel(text: "ends with")
-                    .help("Only a last line that's just this phrase counts, so \u{201C}Not \(flow.stopPhrase.isEmpty ? "LGTM" : flow.stopPhrase)\u{201D} won't stop the flow. Ask for it that way in your prompt.")
-                TextField("LGTM", text: $flow.stopPhrase)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(FieldBackground())
-                    .frame(maxWidth: 110)
+                    .help("Only a last line that's just this phrase counts, so \u{201C}Not \(Flow.phrases(flow.stopPhrase).first ?? "LGTM")\u{201D} won't stop the flow. Ask for it that way in your prompt.")
+                if !wide { stopField }
                 Spacer(minLength: 4)
                 Menu {
                     ForEach([3, 5, 10, 20, 50], id: \.self) { n in
@@ -614,12 +625,23 @@ struct FlowFooter: View {
                 .foregroundStyle(Theme.text2)
                 .help("Stop after this many rounds, whatever they say")
             }
+            if wide { stopField }
             HStack(spacing: 8) {
                 FlowStatus(flow: flow, a: a, b: b)
                 Spacer(minLength: 6)
                 RunButton(flow: flow)
             }
         }
+    }
+
+    private var stopField: some View {
+        TextField("LGTM", text: $flow.stopPhrase)
+            .textFieldStyle(.plain)
+            .font(.system(size: 11.5, design: .monospaced))
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(FieldBackground())
+            .frame(minWidth: 60, maxWidth: .infinity)
+            .help("Separate alternatives with a comma. The first finishes the flow; any other hands it back to you, e.g. APPROVED, NEEDS HUMAN")
     }
 
     private var watchLabel: String {
@@ -662,6 +684,7 @@ struct FlowStatus: View {
         let busy = store.session(flow.busy)
         let (icon, text, color): (String, String, Color) =
             if !store.running { ("pause.circle.fill", "Relay is paused", Theme.paused) }
+            else if let halted = flow.halted, flow.needsYou { ("hand.raised.fill", "Needs you · \(halted)", Theme.paused) }
             else if let halted = flow.halted { ("checkmark.seal.fill", "Done in \(flow.rounds) round\(flow.rounds == 1 ? "" : "s") · \(halted)", Theme.live) }
             else if let busy { ("ellipsis.circle.fill", "Round \(flow.rounds) · \(busy.kind.label) is replying", busy.kind.tint) }
             else if flow.enabled && flow.rounds > 0 { ("arrow.triangle.2.circlepath", "Round \(flow.rounds) · waiting for the next answer", Theme.text2) }
@@ -744,9 +767,11 @@ struct PresetMenu: View {
         let current = store.preset(flow.presetID)
         let edited = current.map { !$0.matches(flow) } ?? false
         Menu {
-            Section("Built in") {
-                ForEach(Preset.builtIns) { p in
-                    Button(p.name) { store.apply(p, to: flow.id) }
+            ForEach(Preset.builtInGroups, id: \.title) { group in
+                Section(group.title) {
+                    ForEach(group.presets) { p in
+                        Button(p.name) { store.apply(p, to: flow.id) }
+                    }
                 }
             }
             if !store.presets.isEmpty {
@@ -778,7 +803,7 @@ struct PresetMenu: View {
     }
 
     private static func short(_ name: String) -> String {
-        name.count > 15 ? String(name.prefix(14)) + "…" : name
+        name.count > 13 ? String(name.prefix(12)) + "…" : name
     }
 }
 
@@ -821,13 +846,16 @@ struct SavePresetRow: View {
 
 struct AppliedPresetRow: View {
     let name: String
+    let placement: String?
     let undo: () -> Void
 
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.live)
-            Text("Applied \u{201C}\(name)\u{201D}").lineLimit(1)
-            Spacer()
+            Text("Applied \u{201C}\(name)\u{201D}" + (placement.map { " · \($0)" } ?? ""))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 4)
             Button("Undo", action: undo).buttonStyle(.plain).foregroundStyle(Theme.text1).fontWeight(.semibold)
         }
         .font(.system(size: 11))

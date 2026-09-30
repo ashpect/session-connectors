@@ -131,10 +131,13 @@ struct Flow: Identifiable, Equatable, Codable {
     var maxRounds = 10
     var enabled = false       // on after Start; answers only move while a flow is on
     var presetID: String?     // the preset this flow was set up from, if any
+    var roleA: String?        // what each side is in that setup ("Reviewer", "Author"), shown on the slots
+    var roleB: String?
 
     var rounds = 0            // A → B sends in this run
     var backSends = 0
     var halted: String?
+    var needsYou = false      // it stopped without finishing: a hand-off phrase, the round limit, or a failed send
     var busy: String?         // the session currently answering something this flow sent it
     var pendingUntil: Date?   // an answer is waiting out the send delay until then…
     var pendingTo: String?    // …on its way to this session
@@ -142,7 +145,7 @@ struct Flow: Identifiable, Equatable, Codable {
     var backPulse = 0
 
     private enum CodingKeys: String, CodingKey {
-        case id, a, b, forward, back, loop, stopPhrase, stopWatch, maxRounds, presetID
+        case id, a, b, forward, back, loop, stopPhrase, stopWatch, maxRounds, presetID, roleA, roleB
     }
 
     var isComplete: Bool { a != nil && b != nil }
@@ -156,10 +159,22 @@ struct Flow: Identifiable, Equatable, Codable {
     /// (markdown and punctuation around it are fine). "Not AGREED", "AGREED?", or the word in the
     /// middle of a reply don't count, so a reply that merely mentions the phrase doesn't end the flow.
     static func signsOff(_ answer: String, with phrase: String) -> Bool {
-        let target = signOffLine(phrase)
-        guard !target.isEmpty else { return false }
-        let last = answer.split(whereSeparator: \.isNewline).map { signOffLine(String($0)) }.last { !$0.isEmpty }
-        return last?.caseInsensitiveCompare(target) == .orderedSame
+        signOff(answer, phrases: phrase) != nil
+    }
+
+    /// A flow can have more than one stop phrase, separated by commas: "APPROVED, NEEDS HUMAN".
+    /// The first is the normal finish; the rest hand the decision back to you.
+    static func phrases(_ stopPhrase: String) -> [String] {
+        stopPhrase.split(whereSeparator: { $0 == "," || $0 == "|" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !signOffLine($0).isEmpty }
+    }
+
+    /// The stop phrase `answer` signs off with, if any.
+    static func signOff(_ answer: String, phrases stopPhrase: String) -> String? {
+        guard let last = answer.split(whereSeparator: \.isNewline).map({ signOffLine(String($0)) }).last(where: { !$0.isEmpty })
+        else { return nil }
+        return phrases(stopPhrase).first { signOffLine($0).caseInsensitiveCompare(last) == .orderedSame }
     }
 
     private static func signOffLine(_ s: String) -> String {
@@ -177,7 +192,7 @@ struct Flow: Identifiable, Equatable, Codable {
 }
 
 struct LogEntry: Identifiable {
-    enum Kind { case send, stop, info }
+    enum Kind { case send, stop, warn, info }
     let id = UUID()
     let date = Date()
     let kind: Kind
@@ -330,6 +345,8 @@ final class RelayStore {
             flows[i].b = f.a
             flows[i].forward = f.back
             flows[i].back = f.forward
+            flows[i].roleA = f.roleB
+            flows[i].roleB = f.roleA
             flows[i].stopWatch = f.stopWatch == .a ? .b : (f.stopWatch == .b ? .a : .either)
         }
     }
@@ -338,6 +355,7 @@ final class RelayStore {
         flows[i].rounds = 0
         flows[i].backSends = 0
         flows[i].halted = nil
+        flows[i].needsYou = false
         flows[i].busy = nil
         flows[i].pendingUntil = nil
         flows[i].pendingTo = nil
@@ -372,6 +390,7 @@ final class RelayStore {
         guard running else { notice = "Relay is paused. Press Paused to go live."; return }
         withAnimation(.snappy) {
             flows[i].halted = nil
+            flows[i].needsYou = false
             flows[i].enabled = true
             if flows[i].rounds >= flows[i].maxRounds { flows[i].rounds = 0 }
         }
@@ -406,6 +425,7 @@ final class RelayStore {
     struct AppliedPreset: Equatable {
         let before: Flow
         let name: String
+        let placement: String?
     }
 
     var allPresets: [Preset] { Preset.builtIns + presets }
@@ -424,7 +444,9 @@ final class RelayStore {
             flows[i].stopWatch = p.stopWatch
             flows[i].maxRounds = p.maxRounds
             flows[i].presetID = p.id
-            undoApply[flowID] = AppliedPreset(before: before, name: p.name)
+            flows[i].roleA = p.roleA
+            flows[i].roleB = p.roleB
+            undoApply[flowID] = AppliedPreset(before: before, name: p.name, placement: p.placement)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
             guard let self, undoApply[flowID]?.before == before else { return }
@@ -442,6 +464,8 @@ final class RelayStore {
             flows[i].stopWatch = u.before.stopWatch
             flows[i].maxRounds = u.before.maxRounds
             flows[i].presetID = u.before.presetID
+            flows[i].roleA = u.before.roleA
+            flows[i].roleB = u.before.roleB
             undoApply[flowID] = nil
         }
     }
@@ -515,20 +539,26 @@ final class RelayStore {
         guard let src = session(from), let dst = session(to) else { return }
 
         let watching = f.stopWatch == .either || (f.stopWatch == .a) == forward || !f.loop
-        if watching, Flow.signsOff(answer, with: f.stopPhrase) {
+        if watching, let phrase = Flow.signOff(answer, phrases: f.stopPhrase) {
+            // The first phrase is the finish line; any other one hands the decision to you.
+            let handoff = phrase != Flow.phrases(f.stopPhrase).first
+            let rounds = "\(f.rounds) round\(f.rounds == 1 ? "" : "s")"
             withAnimation(.snappy) {
-                flows[i].halted = "\(src.kind.label) said \u{201C}\(f.stopPhrase)\u{201D}"
+                flows[i].halted = "\(src.kind.label) said \u{201C}\(phrase)\u{201D}"
+                flows[i].needsYou = handoff
                 flows[i].busy = nil
             }
-            note(.stop, from: src.kind, "\(src.kind.label) said \u{201C}\(f.stopPhrase)\u{201D} · done in \(f.rounds) round\(f.rounds == 1 ? "" : "s")")
+            note(handoff ? .warn : .stop, from: src.kind,
+                 "\(src.kind.label) said \u{201C}\(phrase)\u{201D} · \(handoff ? "needs you after" : "done in") \(rounds)")
             return
         }
         if forward, f.rounds >= f.maxRounds {
             withAnimation(.snappy) {
                 flows[i].halted = "Hit the \(f.maxRounds)-round limit"
+                flows[i].needsYou = true
                 flows[i].busy = nil
             }
-            note(.stop, from: src.kind, "Stopped after \(f.maxRounds) rounds")
+            note(.warn, from: src.kind, "Stopped after \(f.maxRounds) rounds without a sign-off")
             return
         }
 
@@ -622,6 +652,7 @@ final class RelayStore {
         for i in flows.indices where flows[i].busy == pane {
             withAnimation(.snappy) {
                 flows[i].halted = reason
+                flows[i].needsYou = true
                 flows[i].busy = nil
             }
         }
@@ -872,12 +903,18 @@ final class RelayStore {
                             tty: "/dev/ttys001", path: NSHomeDirectory() + "/code/api-gateway",
                             screen: Demo.codexScreen, isDemo: true)
         for s in [claude, codex] where session(s.id) == nil { sessions.append(s) }
+        // The demo runs the built-in Plan review preset with canned replies.
+        let preset = Preset.planReview
         var flow = Flow(a: claude.id, b: codex.id)
-        flow.forward = "Review the updated plan. List blocking issues first, then nits. Say LGTM if nothing is blocking."
-        flow.back = "Codex reviewed your plan:\n\n{answer}\n\nFix the blocking issues and update PLAN.md."
-        flow.loop = true
-        flow.stopPhrase = "LGTM"
-        flow.stopWatch = .b
+        flow.forward = preset.forward
+        flow.back = preset.back
+        flow.loop = preset.loop
+        flow.stopPhrase = preset.stopPhrase
+        flow.stopWatch = preset.stopWatch
+        flow.maxRounds = preset.maxRounds
+        flow.presetID = preset.id
+        flow.roleA = preset.roleA
+        flow.roleB = preset.roleB
         withAnimation(.snappy) {
             flows.removeAll { !$0.isComplete }
             flows.insert(flow, at: 0)
@@ -893,7 +930,7 @@ enum Demo {
         case .codex:
             return turn < 2
                 ? "Review of rev \(turn): 2 blocking. (1) The Redis keys have no TTL, so idle tenants leak memory. (2) Limits are re-read on every request instead of cached. 1 nit: name the config flag."
-                : "Review of rev \(turn): nothing blocking left. Nit: document the Retry-After header. LGTM."
+                : "Review of rev \(turn): nothing blocking left. Nit: document the Retry-After header.\n\nLGTM"
         case .shell:
             return "exit 0"
         }
@@ -903,7 +940,9 @@ enum Demo {
     static func gist(_ s: String) -> String {
         let plain = s.replacingOccurrences(of: #"[*_`#>]"#, with: "", options: .regularExpression)
         let line = plain.split(whereSeparator: \.isNewline).first.map(String.init) ?? plain
-        let sentence = line.range(of: ". ").map { String(line[..<$0.lowerBound]) } ?? line
+        // Cut at the first sentence end, but not inside a list marker like "1. " at the very start.
+        let from = line.index(line.startIndex, offsetBy: min(12, line.count))
+        let sentence = line.range(of: ". ", range: from..<line.endIndex).map { String(line[..<$0.lowerBound]) } ?? line
         let t = sentence.trimmingCharacters(in: .whitespaces)
         return t.count > 44 ? String(t.prefix(44)) + "…" : t
     }

@@ -466,7 +466,7 @@ struct LogLine: View {
             }
             Text(entry.text)
                 .font(.system(size: 10.5))
-                .foregroundStyle(entry.kind == .stop ? Theme.live : (entry.kind == .send ? Theme.text1 : Theme.text2))
+                .foregroundStyle(entry.kind == .stop ? Theme.live : entry.kind == .warn ? Theme.paused : entry.kind == .send ? Theme.text1 : Theme.text2)
                 .lineLimit(1)
                 .truncationMode(.tail)
         }

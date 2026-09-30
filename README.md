@@ -67,7 +67,7 @@ Open Relay from the menu bar icon (two dots joined by a thread), or press **⌃�
 1. **Fill a flow.** Click the top slot, then click the pane whose answers should go first, for example the Claude session writing your plan. Click the bottom slot, then click the pane that should receive them, for example Codex reviewing it. You can also press **Pick** twice (it fills the top slot, then the bottom), drag a session chip onto a slot, or use **Choose**.
 2. **Write the prompts.** Click the prompt on a connection to edit it. The answer goes where `{answer}` is. If you leave `{answer}` out, the answer is added at the end, and an empty prompt sends the answer as-is.
 3. **Turn on Loop** if the reply should come back up to the first session.
-4. **Set the stop rule:** stop when *either / Claude / Codex* ends its reply with a phrase, with a maximum number of rounds as a backstop. Only a **last line that's just the phrase** counts (`AGREED`, `**AGREED**` and `AGREED.` all do). A reply that merely mentions it, like "Not AGREED, because…", keeps the loop going. Ask for it that way in your prompt: *"If you have concerns, don't use the word AGREED. Only when you're fully happy, end with a last line that says just: AGREED."* The built-in presets already do.
+4. **Set the stop rule:** stop when *either / Claude / Codex* ends its reply with a phrase, with a maximum number of rounds as a backstop. Only a **last line that's just the phrase** counts (`AGREED`, `**AGREED**` and `AGREED.` all do). A reply that merely mentions it, like "Not AGREED, because…", keeps the loop going. Ask for it that way in your prompt: *"If you have concerns, don't use the word AGREED. Only when you're fully happy, end with a last line that says just: AGREED."* The built-in presets already do. You can give more than one phrase, separated by commas (`APPROVED, NEEDS HUMAN`): the first one finishes the flow, and any other stops it and marks it as needing you.
 5. **Press Start.** Relay sends the first session's latest answer right away. If that session hasn't answered since Relay started, its next answer goes first. To switch a flow on *without* sending the latest answer (say, you've already dealt with it), use the flow's **⋯ → Turn on without sending**. To pick a loop up where it stopped, use **⋯ → Send Claude's latest answer to Codex**, or the reverse. **Stop** ends a flow, and **Live / Paused** in the header pauses every flow.
 
 Want to look around before connecting real sessions? Choose **⋯ → Load demo flow**.
@@ -80,17 +80,22 @@ A preset is a saved flow setup: one-way or loop, both prompts, and the stop rule
 - **Save as preset…** Name the flow's current setup and reuse it on other flows.
 - **Update "…" with this setup** appears after you've edited a flow that came from one of your saved presets. It updates the preset to match. A dot after the preset's name (`My review loop •`) means the flow has changed since you applied it.
 
-Relay ships with three presets:
+Relay ships with six presets. Each one names a role for the top and bottom session, so the empty slots tell you what to pick ("Pick the reviewer", "Pick the author") and each docked session shows its role.
 
-| Preset | Mode | What it does | Stops when |
+| Preset | Top → bottom | What it does | Stops when |
 |---|---|---|---|
-| **Plan review** | Loop | One session writes the plan and the other reviews it; the review goes back for fixes | the reviewer ends with `LGTM` (max 6 rounds) |
-| **Plan discussion** | Loop | Two peers talk the plan through, accepting points and pushing back | either ends with `AGREED` (max 6 rounds) |
-| **Second opinion** | One-way | Sends an answer off for a quick check | — |
+| **Plan review** | Planner → Reviewer | One session writes the plan and the other reviews it; the review goes back for fixes | the reviewer ends with `LGTM` |
+| **Plan discussion** | Proposer → Responder | Two peers talk the plan through, accepting points and pushing back | either ends with `AGREED` |
+| **PR review** | Reviewer → Author | The reviewer's findings go to the author, who fixes each one or pushes back with reasons. The reviewer then checks the fixes in the code and judges each pushback | the reviewer ends with `APPROVED`, or `NEEDS HUMAN` |
+| **Review my changes** | Author → Reviewer | The same loop, started from the author's own summary of what it changed | the reviewer ends with `APPROVED`, or `NEEDS HUMAN` |
+| **Root-cause check** | Investigator → Skeptic | One session diagnoses a failure; the other tries to disprove it and asks for evidence | the skeptic ends with `CONFIRMED`, or `NEEDS HUMAN` |
+| **Second opinion** | Source → Checker | One-way: sends an answer off for a quick check | — |
 
-You can see and rename your saved presets, or delete them, in **⋯ → Settings… → Presets**. They're stored in `~/.relay/presets.json`, so you can copy that file to share them.
+To review a PR: put the reviewing session on top and the session that wrote the code below, apply **PR review**, press **Start**, and ask the reviewer to review the PR (numbered findings work best). Relay carries the rest. With **Review my changes** the author goes on top instead, and **Start** sends its latest message, such as "done, here's what I changed", straight off for review.
 
-For example, to review a plan with Claude and Codex: put Claude (writing the plan) in the top slot and Codex in the bottom, apply **Plan review**, and press **Start**. Or ask Claude for the plan first; once it answers, Relay takes it from there.
+**When they can't agree.** The three review presets have a second way out. If a point has been argued once by each side and neither has anything new, the reviewer lists it under "Needs a human decision" with both positions and ends with `NEEDS HUMAN`. Relay stops and shows **Needs you** instead of letting them repeat themselves until the round limit. You decide, tell one of them, and use **⋯ → Send …'s latest answer** to pick the loop up again.
+
+You can see and rename your saved presets, or delete them, in **⋯ → Settings… → Presets**. They're stored in `~/.relay/presets.json`, so you can copy that file to share them. `Relay --dump-presets` prints the built-in ones in the same format.
 
 ### Settings
 
@@ -115,6 +120,7 @@ The session menu (**⋯** on each session) also has Reveal in iTerm, Replace, an
 
 - **Relay types into panes.** Don't type in a pane that's part of a running flow, or your half-written text will mix with Relay's message.
 - **A busy session isn't interrupted.** If the receiving session is mid-turn, Relay waits for that turn to end and then sends.
+- **A session that stops to ask permission stalls the flow.** If Claude Code or Codex shows a prompt like "Do you want to proceed?", the turn hasn't ended, so Relay keeps waiting and shows "is replying". For flows that edit code or run commands, put those sessions in a mode that doesn't ask (accept edits, auto, or your usual setting), or answer the prompt in the pane.
 - **Relay only hears turns while it's running.** When Relay is closed, the hook exits immediately and does nothing.
 - **The hook runs on every turn of every session.** It's a tiny program that forwards the event and prints nothing. Relay ignores sessions that aren't in a flow.
 - **Your flows are saved** in `~/.relay/state.json`.

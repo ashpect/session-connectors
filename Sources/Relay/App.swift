@@ -7,6 +7,13 @@ enum Main {
     static func main() {
         // Installed as ~/.relay/relay-hook, the same binary runs as the Claude Code / Codex hook.
         if (CommandLine.arguments[0] as NSString).lastPathComponent == "relay-hook" { HookCLI.run() }
+        // `Relay --dump-presets` prints the built-in presets as JSON (the same shape as ~/.relay/presets.json).
+        if CommandLine.arguments.contains("--dump-presets") {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            print(String(decoding: (try? encoder.encode(Preset.builtIns)) ?? Data(), as: UTF8.self))
+            exit(0)
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
@@ -53,6 +60,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store.checkHooks()
             if CommandLine.arguments.contains("--start-flows") {
                 for f in store.flows where f.isComplete { store.start(f.id) }
+            }
+            if CommandLine.arguments.contains("--arm-flows") {
+                for f in store.flows where f.isComplete { store.arm(f.id) }
             }
         }
 
@@ -194,6 +204,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store.flows[0].presetID = store.presets[0].id
             store.flows[0].stopPhrase = "SHIP IT"
         }
+        if args.contains("--needs-you") {
+            store.flows[0].halted = "Codex said \u{201C}NEEDS HUMAN\u{201D}"
+            store.flows[0].needsYou = true
+            store.flows[0].rounds = 2
+        }
+        if args.contains("--empty-slots") { store.flows[0].a = nil; store.flows[0].b = nil; store.sessions = [] }
         if args.contains("--oneway") { store.flows[0].loop = false }
         if args.contains("--half") { store.flows[0].b = nil }
         if args.contains("--peek"), let a = store.flows[0].a { store.peeking.insert(a) }
@@ -204,7 +220,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let view = panel.contentView!
             view.wantsLayer = true
             view.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
-            let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+            // Always render at 2x, whatever display this happens to run on.
+            let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(view.bounds.width * 2), pixelsHigh: Int(view.bounds.height * 2),
+                                       bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                       colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+            rep.size = view.bounds.size
             view.cacheDisplay(in: view.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
             NSApp.terminate(nil)
