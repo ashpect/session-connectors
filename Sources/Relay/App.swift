@@ -76,18 +76,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let i = CommandLine.arguments.firstIndex(of: "--thread-snapshot"), i + 1 < CommandLine.arguments.count {
             // Scripted pick: armed from the Pick button → click a pane → it latches, then reels into Relay.
             let out = CommandLine.arguments[i + 1], thread = ThreadOverlay()
-            let button = NSPoint(x: 1100, y: 1000), pane = NSPoint(x: 350, y: 600)
+            // `--thread-to x,y` puts the clicked pane somewhere else, e.g. on another display.
+            var pane = NSPoint(x: 350, y: 600)
+            if let j = CommandLine.arguments.firstIndex(of: "--thread-to"), j + 1 < CommandLine.arguments.count {
+                let xy = CommandLine.arguments[j + 1].split(separator: ",").compactMap { Double($0) }
+                if xy.count == 2 { pane = NSPoint(x: xy[0], y: xy[1]) }
+            }
+            let button = NSPoint(x: 1100, y: 1000)
             func save(_ name: String) {
                 try? thread.debugImage()?.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out + name + ".png"))
             }
             thread.attach(at: button, color: NSColor(Theme.live))
+            thread.debugScreens().forEach { print("overlay", $0) }
             thread.debugRun(frames: 240, cursor: pane)
             save("1-armed")
             thread.pin(at: pane)
             thread.connect(to: pane, color: NSColor(Theme.claude)) {}
-            thread.debugRun(frames: 30, cursor: NSPoint(x: 420, y: 560))
+            let away = NSPoint(x: pane.x + 70, y: pane.y - 40)
+            thread.debugRun(frames: 30, cursor: away)
             save("2-latched")
-            thread.debugRun(frames: 16, cursor: NSPoint(x: 420, y: 560))
+            thread.debugRun(frames: 16, cursor: away)
             save("3-reeling")
             NSApp.terminate(nil)
         }

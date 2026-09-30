@@ -5,12 +5,65 @@ import QuartzCore
 /// cursor; when you click a pane its loose end latches onto that pane, takes the session's color,
 /// and gets pulled back into Relay. It's a small verlet rope, so it sags and swings as you move.
 final class ThreadOverlay {
-    private let window: OverlayWindow
-    private let line = CAShapeLayer()
-    private let glow = CAShapeLayer()
-    private let pin = CAShapeLayer()
-    private let ring = CAShapeLayer()
-    private let endPin = CAShapeLayer()
+    /// One transparent window per display, each drawing the same rope. With "Displays have separate
+    /// Spaces" on (the macOS default) a window only ever shows on one display, so a single window
+    /// stretched across all of them leaves every other display without a thread.
+    private final class Pane {
+        let window: OverlayWindow
+        let line = CAShapeLayer()
+        let glow = CAShapeLayer()
+        let pin = CAShapeLayer()
+        let ring = CAShapeLayer()
+        let endPin = CAShapeLayer()
+        var origin: CGPoint { window.frame.origin }
+
+        init(screen: NSScreen) {
+            window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            window.setFrame(screen.frame, display: false)
+            window.level = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue - 1)
+            window.backgroundColor = .clear
+            window.isOpaque = false
+            window.hasShadow = false
+            window.ignoresMouseEvents = true
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+            let view = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+            view.wantsLayer = true
+            window.contentView = view
+            let root = view.layer!
+
+            for l in [glow, line] {
+                l.fillColor = nil
+                l.lineCap = .round
+                l.lineJoin = .round
+                root.addSublayer(l)
+            }
+            glow.lineWidth = 7
+            line.lineWidth = 2.2
+            line.shadowColor = NSColor.black.cgColor
+            line.shadowOpacity = 0.35
+            line.shadowRadius = 2
+            line.shadowOffset = CGSize(width: 0, height: -1)
+
+            ring.fillColor = nil
+            ring.lineWidth = 1.5
+            ring.path = CGPath(ellipseIn: CGRect(x: -9, y: -9, width: 18, height: 18), transform: nil)
+            for p in [pin, endPin] {
+                p.path = CGPath(ellipseIn: CGRect(x: -4.5, y: -4.5, width: 9, height: 9), transform: nil)
+                p.strokeColor = NSColor.white.withAlphaComponent(0.9).cgColor
+                p.lineWidth = 1.5
+            }
+            root.addSublayer(ring)
+            root.addSublayer(pin)
+            root.addSublayer(endPin)
+        }
+
+        func local(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x - origin.x, y: p.y - origin.y) }
+    }
+
+    private var panes: [Pane] = []
+    private var screensObserver: NSObjectProtocol?
+    private var color = NSColor.white
     private var timer: Timer?
 
     private enum Reel: Equatable {
@@ -20,6 +73,7 @@ final class ThreadOverlay {
         case backToAnchor         // loose end flies back into the pinned end
     }
 
+    // Everything below is in screen coordinates; each pane shifts it into its own window.
     private var anchor = NSPoint.zero
     private var tail: NSPoint?
     private var endTarget: NSPoint?
@@ -31,62 +85,30 @@ final class ThreadOverlay {
     private static let count = 20
 
     init() {
-        let frame = NSScreen.screens.reduce(NSRect.null) { $0.union($1.frame) }
-        window = OverlayWindow(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        window.level = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue - 1)
-        window.backgroundColor = .clear
-        window.isOpaque = false
-        window.hasShadow = false
-        window.ignoresMouseEvents = true
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-
-        let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
-        view.wantsLayer = true
-        window.contentView = view
-        let root = view.layer!
-
-        for l in [glow, line] {
-            l.fillColor = nil
-            l.lineCap = .round
-            l.lineJoin = .round
-            root.addSublayer(l)
-        }
-        glow.lineWidth = 7
-        line.lineWidth = 2.2
-        line.shadowColor = NSColor.black.cgColor
-        line.shadowOpacity = 0.35
-        line.shadowRadius = 2
-        line.shadowOffset = CGSize(width: 0, height: -1)
-
-        ring.fillColor = nil
-        ring.lineWidth = 1.5
-        ring.path = CGPath(ellipseIn: CGRect(x: -9, y: -9, width: 18, height: 18), transform: nil)
-        for p in [pin, endPin] {
-            p.path = CGPath(ellipseIn: CGRect(x: -4.5, y: -4.5, width: 9, height: 9), transform: nil)
-            p.strokeColor = NSColor.white.withAlphaComponent(0.9).cgColor
-            p.lineWidth = 1.5
-        }
-        root.addSublayer(ring)
-        root.addSublayer(pin)
-        root.addSublayer(endPin)
+        panes = NSScreen.screens.map(Pane.init)
+        // A display was plugged in, unplugged or rearranged: cover the new layout.
+        screensObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                                 object: nil, queue: .main) { [weak self] _ in self?.screensChanged() }
     }
 
-    /// Start a fresh thread pinned at `anchor` (screen coordinates), loose end on the cursor.
-    func attach(at anchor: NSPoint, color: NSColor) {
-        flushCompletion()
-        reel = .none
-        tail = nil
-        endTarget = nil
-        self.anchor = anchor
-        let a = local(anchor)
-        points = Array(repeating: a, count: Self.count)
-        previous = points
+    deinit {
+        if let screensObserver { NotificationCenter.default.removeObserver(screensObserver) }
+    }
 
+    private func screensChanged() {
+        panes.forEach { $0.window.orderOut(nil) }
+        panes = NSScreen.screens.map(Pane.init)
+        guard timer != nil else { return }
         setColor(color, animated: false)
+        panes.forEach(show)
+    }
+
+    private func show(_ pane: Pane) {
+        let a = pane.local(anchor)
         withoutAnimation {
-            pin.position = a
-            ring.position = a
-            endPin.isHidden = true
+            pane.pin.position = a
+            pane.ring.position = a
+            pane.endPin.isHidden = true
         }
         let pulse = CABasicAnimation(keyPath: "transform.scale")
         pulse.fromValue = 0.6
@@ -98,10 +120,24 @@ final class ThreadOverlay {
         group.animations = [pulse, fade]
         group.duration = 1.2
         group.repeatCount = .infinity
-        ring.add(group, forKey: "pulse")
+        pane.ring.add(group, forKey: "pulse")
 
-        window.alphaValue = 1
-        window.orderFrontRegardless()
+        pane.window.alphaValue = 1
+        pane.window.orderFrontRegardless()
+    }
+
+    /// Start a fresh thread pinned at `anchor` (screen coordinates), loose end on the cursor.
+    func attach(at anchor: NSPoint, color: NSColor) {
+        flushCompletion()
+        reel = .none
+        tail = nil
+        endTarget = nil
+        self.anchor = anchor
+        points = Array(repeating: anchor, count: Self.count)
+        previous = points
+
+        setColor(color, animated: false)
+        panes.forEach(show)
         if timer == nil {
             timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in self?.tick() }
             RunLoop.main.add(timer!, forMode: .common)
@@ -109,14 +145,17 @@ final class ThreadOverlay {
     }
 
     func setColor(_ color: NSColor, animated: Bool) {
+        self.color = color
         CATransaction.begin()
         CATransaction.setDisableActions(!animated)
         CATransaction.setAnimationDuration(0.25)
-        line.strokeColor = color.cgColor
-        glow.strokeColor = color.withAlphaComponent(0.22).cgColor
-        pin.fillColor = color.cgColor
-        endPin.fillColor = color.cgColor
-        ring.strokeColor = color.withAlphaComponent(0.6).cgColor
+        for p in panes {
+            p.line.strokeColor = color.cgColor
+            p.glow.strokeColor = color.withAlphaComponent(0.22).cgColor
+            p.pin.fillColor = color.cgColor
+            p.endPin.fillColor = color.cgColor
+            p.ring.strokeColor = color.withAlphaComponent(0.6).cgColor
+        }
         CATransaction.commit()
     }
 
@@ -157,11 +196,14 @@ final class ThreadOverlay {
         reel = .none
         timer?.invalidate()
         timer = nil
-        ring.removeAllAnimations()
         flushCompletion()
-        guard animated else { return window.orderOut(nil) }
-        NSAnimationContext.runAnimationGroup({ $0.duration = 0.18; window.animator().alphaValue = 0 },
-                                             completionHandler: { [window] in window.orderOut(nil) })
+        for p in panes {
+            p.ring.removeAllAnimations()
+            let window = p.window
+            guard animated else { window.orderOut(nil); continue }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.18; window.animator().alphaValue = 0 },
+                                                 completionHandler: { window.orderOut(nil) })
+        }
     }
 
     // MARK: -
@@ -173,17 +215,31 @@ final class ThreadOverlay {
         for _ in 0..<frames where timer != nil { tick() }
     }
 
-    /// Debug: render the overlay into a bitmap over a dark background.
+    /// Debug: render every display's overlay into one bitmap over a dark background.
     func debugImage() -> NSBitmapImageRep? {
-        let size = window.frame.size
-        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
+        let frame = panes.reduce(NSRect.null) { $0.union($1.window.frame) }
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(frame.width), pixelsHigh: Int(frame.height),
                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                                          colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
               let ctx = NSGraphicsContext(bitmapImageRep: rep)?.cgContext else { return nil }
-        ctx.setFillColor(NSColor(white: 0.12, alpha: 1).cgColor)
-        ctx.fill(CGRect(origin: .zero, size: size))
-        window.contentView!.layer!.render(in: ctx)
+        ctx.setFillColor(NSColor(white: 0.05, alpha: 1).cgColor)
+        ctx.fill(CGRect(origin: .zero, size: frame.size))
+        for p in panes {
+            ctx.saveGState()
+            ctx.translateBy(x: p.origin.x - frame.minX, y: p.origin.y - frame.minY)
+            let bounds = CGRect(origin: .zero, size: p.window.frame.size)
+            ctx.clip(to: bounds)                       // a window shows nothing outside its own display
+            ctx.setFillColor(NSColor(white: 0.12, alpha: 1).cgColor)
+            ctx.fill(bounds)
+            p.window.contentView!.layer!.render(in: ctx)
+            ctx.restoreGState()
+        }
         return rep
+    }
+
+    /// Debug: which display each overlay window ended up on.
+    func debugScreens() -> [String] {
+        panes.map { "\($0.window.frame) on \($0.window.screen?.localizedName ?? "no screen")" }
     }
 
     private func tick() {
@@ -201,16 +257,19 @@ final class ThreadOverlay {
             if hypot(end.x - anchor.x, end.y - anchor.y) < 4 { return hide(animated: false) }
         }
 
-        let a = local(anchor), e = local(end)
-        step(anchor: a, end: e)
+        step(anchor: anchor, end: end)
+        let path = Self.smoothPath(points)
         withoutAnimation {
-            let path = Self.smoothPath(points)
-            line.path = path
-            glow.path = path
-            pin.position = a
-            ring.position = a
-            endPin.position = e
-            endPin.isHidden = reel == .none || reel == .backToAnchor
+            for p in panes {
+                var shift = CGAffineTransform(translationX: -p.origin.x, y: -p.origin.y)
+                let local = path.copy(using: &shift)
+                p.line.path = local
+                p.glow.path = local
+                p.pin.position = p.local(anchor)
+                p.ring.position = p.local(anchor)
+                p.endPin.position = p.local(end)
+                p.endPin.isHidden = reel == .none || reel == .backToAnchor
+            }
         }
     }
 
@@ -273,10 +332,6 @@ final class ThreadOverlay {
         NSPoint(x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t)
     }
 
-    private func local(_ p: NSPoint) -> CGPoint {
-        CGPoint(x: p.x - window.frame.origin.x, y: p.y - window.frame.origin.y)
-    }
-
     private func withoutAnimation(_ body: () -> Void) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -285,7 +340,7 @@ final class ThreadOverlay {
     }
 }
 
-/// Borderless windows get clamped to one screen by default; this one spans all of them.
+/// Borderless windows get nudged to stay under the menu bar by default; these cover their whole display.
 private final class OverlayWindow: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
